@@ -1,6 +1,6 @@
 {
   "name": "agent-coordinator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   "type": "module",
@@ -18,11 +18,11 @@
   },
   "scripts": {
     "build": "tsup",
-    "prepare": "npm run build",
     "dev": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/**/*.test.ts",
-    "check": "npm run typecheck && npm test && npm run build",
+    "check:dist": "git diff --exit-code -- dist",
+    "check": "npm run typecheck && npm test && npm run build && npm run check:dist",
     "demo:asset": "npm run build && node scripts/render-terminal-demo.mjs"
   },
   "dependencies": {

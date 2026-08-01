@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-coordinator-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          package_tag="v$(node --print "require('./package.json').version")"
+          test "$RELEASE_TAG" = "$package_tag" || {
+            echo "Tag $RELEASE_TAG does not match package version $package_tag" >&2
+            exit 1
+          }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify release
+        run: npm run check
+
+      - name: Build installable archive
+        id: package
+        run: |
+          package_file="$(npm pack --silent | tail -n 1)"
+          test -f "$package_file"
+          echo "file=$package_file" >> "$GITHUB_OUTPUT"
+
+      - name: Publish or refresh private release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_FILE: ${{ steps.package.outputs.file }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$PACKAGE_FILE" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$PACKAGE_FILE" \
+              --verify-tag \
+              --generate-notes \
+              --title "Agent Coordinator $RELEASE_TAG"
+          fi

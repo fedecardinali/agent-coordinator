@@ -1,0 +1,45 @@
+{
+  "name": "agent-coordinator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
+  "type": "module",
+  "bin": {
+    "coordinator": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "docs/assets",
+    "templates",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.12.0"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepare": "npm run build",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/**/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build",
+    "demo:asset": "npm run build && node scripts/render-terminal-demo.mjs"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.7.0",
+    "commander": "^14.0.3",
+    "picocolors": "^1.1.1",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.27",
+    "tsup": "^8.5.1",
+    "tsx": "^4.20.6",
+    "typescript": "^7.0.2"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
+  },
+  "license": "UNLICENSED"
+}

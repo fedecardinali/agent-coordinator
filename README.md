@@ -433,6 +433,9 @@ It requires:
 - GitHub Environments matching the declared root and optional child deployment
   state.
 
+Branch allow-list patterns use path-aware globs: `*` matches one branch-name
+segment and `**` may span `/` separators.
+
 The coordinator validates and triggers child runs; it does not wait for their
 eventual completion, provision secrets, or deploy directly to a cloud provider.
 

@@ -106,6 +106,9 @@ test("deployment planner distinguishes current, running, and blocked states", as
     ),
     "feature/api-demo",
   );
+  assert.equal(planner.branchMatches("feature/*", "feature/demo"), true);
+  assert.equal(planner.branchMatches("feature/*", "feature/team/demo"), false);
+  assert.equal(planner.branchMatches("feature/**", "feature/team/demo"), true);
 });
 
 test("workflow observation scans 100 runs and prioritizes an active run", async () => {

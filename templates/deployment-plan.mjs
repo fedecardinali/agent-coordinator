@@ -23,10 +23,13 @@ function outputKey(value) {
   return value.replaceAll("-", "_");
 }
 
-function branchMatches(pattern, branch) {
+export function branchMatches(pattern, branch) {
+  const doubleStar = "\u0000";
   const expression = `^${pattern
+    .replaceAll("**", doubleStar)
     .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
-    .replaceAll("*", ".*")}$`;
+    .replaceAll("*", "[^/]*")
+    .replaceAll(doubleStar, ".*")}$`;
   return new RegExp(expression).test(branch);
 }
 

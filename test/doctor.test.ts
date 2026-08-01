@@ -13,7 +13,7 @@ test("doctor accepts a clean first submodule whose SHA starts with a digit", (co
   const child = createChildRemote(temporary, "api");
   const root = path.join(temporary, "product-coordinator");
   const manifest = coordinatorManifestSchema.parse({
-    schemaVersion: 1,
+    schemaVersion: 2,
     name: "product-coordinator",
     repositories: [
       {

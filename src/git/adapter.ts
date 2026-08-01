@@ -12,6 +12,18 @@ export type GitCoordinatorLocation =
   | { kind: "command"; command: string; arguments: string[] }
   | { kind: "source"; command: string; arguments: string[]; path: string };
 
+export function yamlNativeGitRuntimeActive(root: string): boolean {
+  const result = runCommand(
+    "git",
+    ["-C", root, "config", "--local", "--get", "gitCoordinator.manifest"],
+    {
+      allowFailure: true,
+      env: { GIT_COORDINATOR_INTERNAL: "1" },
+    },
+  );
+  return result.status === 0 && result.stdout === "coordinator.yaml";
+}
+
 function sourceLocation(source: string): GitCoordinatorLocation {
   return {
     kind: "source",

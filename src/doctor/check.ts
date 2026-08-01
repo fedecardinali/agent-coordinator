@@ -1,9 +1,10 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { commandAvailable, runCommand } from "../core/command.js";
 import { errorMessage } from "../core/errors.js";
 import type { CoordinatorManifest } from "../core/schema.js";
 import { findGitCoordinator, invokeGitCoordinator } from "../git/adapter.js";
+import { isOwnedGitConfiguration } from "../git/configuration.js";
 import { synchronizeWorkspace } from "../workspace/sync.js";
 
 export type CheckStatus = "pass" | "warn" | "fail";
@@ -91,15 +92,39 @@ export function runDoctor(
     }),
   );
   checks.push(
-    check("Generated configuration", () => {
+    check("Native Git manifest", () => {
+      const legacyPath = path.join(root, ".git-coordinator.json");
+      if (!existsSync(legacyPath)) {
+        if (manifest.workspaceManifest) {
+          return {
+            detail: `coordinator.yaml still references legacy ${manifest.workspaceManifest.path}`,
+            status: "warn",
+          };
+        }
+        return { detail: "coordinator.yaml is the only Git configuration" };
+      }
+      const legacy = readFileSync(legacyPath, "utf8");
+      return isOwnedGitConfiguration(legacy)
+        ? {
+            detail: "owned legacy adapter remains; run coordinator sync",
+            status: "fail",
+          }
+        : {
+            detail: "unmanaged legacy adapter was preserved",
+            status: "warn",
+          };
+    }),
+  );
+  checks.push(
+    check("Generated outputs", () => {
       const result = synchronizeWorkspace(root, manifest, version, { check: true });
       return result.changed
         ? { detail: "generated files are stale; run coordinator sync", status: "fail" }
         : {
             detail:
               manifest.agents.manage === false
-                ? "Git and CI are synchronized; existing agent files are intentionally unmanaged"
-                : "Git, agents, skills, and CI are synchronized",
+                ? "CI is synchronized; existing agent files are intentionally unmanaged"
+                : "agents, skills, and CI are synchronized",
           };
     }),
   );

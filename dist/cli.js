@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.ts
-import path15 from "path";
+import path16 from "path";
 import { Command, CommanderError } from "commander";
 import pc3 from "picocolors";
 
@@ -207,7 +207,9 @@ ${repository.agent.instructions.map((instruction) => `- ${instruction}`).join("\
 
 Before returning, run:
 ${repository.agent.verify.map((command) => `- \`${command}\``).join("\n")}` : "";
-  const workspaceMode = manifest.workspaceManifest ? `
+  const workspaceMode = manifest.workspace ? `
+
+Before editing, read \`workspace.selection.${repository.id}\` in \`coordinator.yaml\` from the current coordinator revision and confirm it is active. If it is pinned, read-only, or absent, stop and report that constraint to the primary agent.` : manifest.workspaceManifest ? `
 
 Before editing, read \`${manifest.workspaceManifest.path}\` from the current coordinator revision and confirm \`${repository.id}\` is active. If it is pinned, read-only, or absent, stop and report that constraint to the primary agent.` : "";
   return `Work only inside \`${repository.path}\`. Never edit the coordinator root${siblings ? ` or sibling repositories ${siblings}` : ""}.
@@ -269,16 +271,17 @@ ${instructions(manifest, repository)}
 `;
 }
 function renderRootAgents(manifest) {
-  const repositoryList = manifest.repositories.map(
-    (repository) => `- \`${repository.id}\`: \`${repository.path}\` (${repository.branch.mode}${repository.branch.readOnly ? ", read-only" : ""}); delegate to the \`${agentName(repository)}\` project agent.`
-  ).join("\n");
+  const repositoryList = manifest.repositories.map((repository) => {
+    const policy = `${repository.branch.mode}${repository.branch.readOnly ? ", read-only" : ""}`;
+    return `- \`${repository.id}\`: \`${repository.path}\` (${policy}); delegate to the \`${agentName(repository)}\` project agent.`;
+  }).join("\n");
   const verify = manifest.repositories.flatMap(
     (repository) => repository.agent.verify.map(
       (command) => `- ${repository.id}: \`${command}\``
     )
   ).join("\n");
-  const workspaceManifest = manifest.workspaceManifest ? `
-A branch-scoped workspace manifest is stored at \`${manifest.workspaceManifest.path}\`. Read the version from the current coordinator HEAD before delegation. Only repositories marked active may receive implementation work; pinned or absent repositories must remain untouched even when their default policy is writable.
+  const workspaceManifest = manifest.workspace ? "\nBranch-scoped repository intent is stored in `workspace.selection` inside `coordinator.yaml`. Read it from the current coordinator HEAD before delegation. Only repositories marked active may receive implementation work; pinned or absent repositories must remain untouched even when their default policy is writable.\n" : manifest.workspaceManifest ? `
+A legacy branch-scoped workspace manifest is stored at \`${manifest.workspaceManifest.path}\`. Read the version from the current coordinator HEAD before delegation. Only repositories marked active may receive implementation work; pinned or absent repositories must remain untouched even when their default policy is writable.
 ` : "";
   return `<!-- ${AGENT_FILE_MARKER}. Edit coordinator.yaml and run coordinator agents sync. -->
 
@@ -1259,6 +1262,10 @@ var relativePath = z.string().min(1).refine(
   (value2) => !path4.isAbsolute(value2) && !value2.split(/[\\/]/).includes("..") && value2 !== ".",
   "must be a safe relative path"
 );
+var relativeDirectoryPath = z.string().min(1).refine(
+  (value2) => !path4.isAbsolute(value2) && !value2.split(/[\\/]/).includes(".."),
+  "must be a safe relative directory path"
+);
 var mirrorFallbackSchema = z.object({ mode: z.literal("mirror") });
 var fixedFallbackSchema = z.object({
   mode: z.literal("fixed"),
@@ -1349,12 +1356,35 @@ var workspaceManifestSchema = z.object({
   coordinatorToken: z.string().min(1).default("$coordinator"),
   mirrorActiveInLinkedWorktrees: z.boolean().default(false)
 });
+var workspaceSelectionEntrySchema = z.object({
+  branch: singleLine,
+  mode: z.enum(["active", "pinned"])
+}).strict();
+var workspaceSchema = z.object({
+  baseBranch: singleLine,
+  coordinatorToken: z.literal("$coordinator").default("$coordinator"),
+  mirrorActiveInLinkedWorktrees: z.boolean().default(false),
+  selection: z.record(identifier, workspaceSelectionEntrySchema)
+}).strict();
+var localComposeSchema = z.object({
+  projectDirectory: relativeDirectoryPath,
+  files: z.array(relativePath).min(1).refine(
+    (files) => new Set(files).size === files.length,
+    "must not contain duplicate Compose files"
+  ),
+  override: z.string().min(1)
+}).strict();
+var localSchema = z.object({
+  compose: localComposeSchema.optional()
+}).strict();
 var coordinatorManifestSchema = z.object({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.union([z.literal(1), z.literal(2)]),
   name: identifier,
   remote: z.string().min(1).default("origin"),
   repositories: z.array(repositorySchema).min(1),
   workspaceManifest: workspaceManifestSchema.optional(),
+  workspace: workspaceSchema.optional(),
+  local: localSchema.optional(),
   agents: agentsSchema.default({
     tools: ["codex"],
     maxParallel: 4,
@@ -1362,6 +1392,28 @@ var coordinatorManifestSchema = z.object({
   }),
   deployments: deploymentsSchema.optional()
 }).superRefine((manifest, context) => {
+  if (manifest.schemaVersion === 1) {
+    if (manifest.workspace) {
+      context.addIssue({
+        code: "custom",
+        path: ["workspace"],
+        message: "requires schemaVersion 2"
+      });
+    }
+    if (manifest.local) {
+      context.addIssue({
+        code: "custom",
+        path: ["local"],
+        message: "requires schemaVersion 2"
+      });
+    }
+  } else if (manifest.workspaceManifest) {
+    context.addIssue({
+      code: "custom",
+      path: ["workspaceManifest"],
+      message: "is legacy schemaVersion 1 syntax; embed the selection in workspace"
+    });
+  }
   const ids = /* @__PURE__ */ new Set();
   const paths = /* @__PURE__ */ new Set();
   const agentNames = /* @__PURE__ */ new Set();
@@ -1391,6 +1443,27 @@ var coordinatorManifestSchema = z.object({
     ids.add(repository.id);
     paths.add(repository.path);
     agentNames.add(agentName2);
+  }
+  if (manifest.workspace) {
+    const selectedIds = new Set(Object.keys(manifest.workspace.selection));
+    for (const repositoryId of ids) {
+      if (!selectedIds.has(repositoryId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["workspace", "selection"],
+          message: `missing repository '${repositoryId}'`
+        });
+      }
+    }
+    for (const repositoryId of selectedIds) {
+      if (!ids.has(repositoryId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["workspace", "selection", repositoryId],
+          message: `unknown repository '${repositoryId}'`
+        });
+      }
+    }
   }
   for (const [environmentName, environment] of Object.entries(
     manifest.deployments?.environments ?? {}
@@ -1776,7 +1849,7 @@ function synchronizeCi(root, manifest, options = {}) {
 }
 
 // src/doctor/check.ts
-import { existsSync as existsSync9 } from "fs";
+import { existsSync as existsSync9, readFileSync as readFileSync7 } from "fs";
 import path10 from "path";
 
 // src/git/adapter.ts
@@ -1795,8 +1868,8 @@ import path8 from "path";
 var PINNED_GIT_COORDINATOR = {
   repository: "fedecardinali/git-coordinator",
   cloneUrl: "https://github.com/fedecardinali/git-coordinator.git",
-  // Retained by the immutable Git Coordinator v0.4.1 tag.
-  ref: "91cc23ab35009855c5ef733f8bb313169ce65355"
+  // Retained by the immutable Git Coordinator v0.5.0 tag.
+  ref: "3fa3eccc54fc7fd8a51a96fd6086ded88aca7ca1"
 };
 function environmentFor(options) {
   return options.environment ?? process.env;
@@ -2026,6 +2099,17 @@ function bootstrapGitCoordinator(options = {}) {
 }
 
 // src/git/adapter.ts
+function yamlNativeGitRuntimeActive(root) {
+  const result = runCommand(
+    "git",
+    ["-C", root, "config", "--local", "--get", "gitCoordinator.manifest"],
+    {
+      allowFailure: true,
+      env: { GIT_COORDINATOR_INTERNAL: "1" }
+    }
+  );
+  return result.status === 0 && result.stdout === "coordinator.yaml";
+}
 function sourceLocation(source) {
   return {
     kind: "source",
@@ -2111,26 +2195,6 @@ function installGitRuntime(workspace = process.cwd(), bootstrapOptions = {}, std
 }
 
 // src/git/configuration.ts
-function gitConfiguration(manifest) {
-  const configuration = {
-    schemaVersion: 2,
-    generatedBy: "agent-coordinator",
-    remote: manifest.remote,
-    repositories: manifest.repositories.map((repository) => ({
-      id: repository.id,
-      path: repository.path,
-      branch: repository.branch
-    }))
-  };
-  if (manifest.workspaceManifest) {
-    configuration.workspaceManifest = manifest.workspaceManifest;
-  }
-  return configuration;
-}
-function renderGitConfiguration(manifest) {
-  return `${JSON.stringify(gitConfiguration(manifest), null, 2)}
-`;
-}
 function isOwnedGitConfiguration(content) {
   try {
     const parsed = JSON.parse(content);
@@ -2142,14 +2206,10 @@ function isOwnedGitConfiguration(content) {
 
 // src/workspace/sync.ts
 function synchronizeWorkspace(root, manifest, generatorVersion, options = {}) {
-  const git4 = planFile(
+  const git4 = planFileDeletion(
     root,
     ".git-coordinator.json",
-    renderGitConfiguration(manifest),
-    {
-      force: options.force,
-      owned: isOwnedGitConfiguration
-    }
+    (content) => yamlNativeGitRuntimeActive(root) && isOwnedGitConfiguration(content)
   );
   const previewOptions = { ...options, check: true };
   const previewAgents = synchronizeAgents(
@@ -2237,10 +2297,32 @@ function runDoctor(root, manifest, version) {
     })
   );
   checks.push(
-    check("Generated configuration", () => {
+    check("Native Git manifest", () => {
+      const legacyPath = path10.join(root, ".git-coordinator.json");
+      if (!existsSync9(legacyPath)) {
+        if (manifest.workspaceManifest) {
+          return {
+            detail: `coordinator.yaml still references legacy ${manifest.workspaceManifest.path}`,
+            status: "warn"
+          };
+        }
+        return { detail: "coordinator.yaml is the only Git configuration" };
+      }
+      const legacy = readFileSync7(legacyPath, "utf8");
+      return isOwnedGitConfiguration(legacy) ? {
+        detail: "owned legacy adapter remains; run coordinator sync",
+        status: "fail"
+      } : {
+        detail: "unmanaged legacy adapter was preserved",
+        status: "warn"
+      };
+    })
+  );
+  checks.push(
+    check("Generated outputs", () => {
       const result = synchronizeWorkspace(root, manifest, version, { check: true });
       return result.changed ? { detail: "generated files are stale; run coordinator sync", status: "fail" } : {
-        detail: manifest.agents.manage === false ? "Git and CI are synchronized; existing agent files are intentionally unmanaged" : "Git, agents, skills, and CI are synchronized"
+        detail: manifest.agents.manage === false ? "CI is synchronized; existing agent files are intentionally unmanaged" : "agents, skills, and CI are synchronized"
       };
     })
   );
@@ -2274,14 +2356,16 @@ function policyLabel(repository) {
   if (repository.branch.mode === "map") return "mapped";
   return "mirror";
 }
-function inspectRepository(root, repository) {
+function inspectRepository(root, repository, selection) {
+  const readOnly = selection?.mode === "pinned" || !selection && repository.branch.readOnly;
+  const policy = selection ? `${selection.mode}:${selection.branch}` : policyLabel(repository);
   const directory = path11.join(root, repository.path);
   if (!existsSync10(directory)) {
     return {
       id: repository.id,
       branch: "\u2014",
-      policy: policyLabel(repository),
-      readOnly: repository.branch.readOnly,
+      policy,
+      readOnly,
       health: "blocked",
       state: "missing"
     };
@@ -2292,15 +2376,19 @@ function inspectRepository(root, repository) {
   return {
     id: repository.id,
     branch: branch ?? "detached",
-    policy: policyLabel(repository),
-    readOnly: repository.branch.readOnly,
-    health: detached && !repository.branch.readOnly ? "attention" : "ready",
-    state: dirty ? "modified" : repository.branch.readOnly ? "read-only" : "clean"
+    policy,
+    readOnly,
+    health: detached && !readOnly ? "attention" : "ready",
+    state: dirty ? "modified" : readOnly ? "read-only" : "clean"
   };
 }
 function inspectWorkspace(root, manifest, version) {
   const repositories = manifest.repositories.map(
-    (repository) => inspectRepository(root, repository)
+    (repository) => inspectRepository(
+      root,
+      repository,
+      manifest.workspace?.selection[repository.id]
+    )
   );
   const rootBranch = gitText2(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]) ?? "unborn";
   const skillsDirectory = path11.join(root, ".agents", "skills");
@@ -2450,6 +2538,56 @@ function renderDashboard(status, options = {}) {
   return lines.join("\n");
 }
 
+// src/local/compose.ts
+import { mkdtempSync as mkdtempSync2, rmSync as rmSync2, writeFileSync as writeFileSync3 } from "fs";
+import os3 from "os";
+import path12 from "path";
+function runLocalCompose(root, manifest, argumentsList, options = {}) {
+  const compose = manifest.local?.compose;
+  if (!compose) {
+    throw new CoordinatorError(
+      "coordinator.yaml does not declare local.compose.",
+      "COMPOSE_NOT_CONFIGURED"
+    );
+  }
+  const resolvedRoot = path12.resolve(root);
+  const temporaryDirectory = mkdtempSync2(
+    path12.join(os3.tmpdir(), "agent-coordinator-compose-")
+  );
+  const overridePath = path12.join(temporaryDirectory, "compose.override.yaml");
+  try {
+    writeFileSync3(
+      overridePath,
+      compose.override.endsWith("\n") ? compose.override : `${compose.override}
+`,
+      { mode: 384 }
+    );
+    return runCommand(
+      "docker",
+      [
+        "compose",
+        "--project-directory",
+        path12.resolve(resolvedRoot, compose.projectDirectory),
+        ...compose.files.flatMap((file) => [
+          "-f",
+          path12.resolve(resolvedRoot, file)
+        ]),
+        "-f",
+        overridePath,
+        ...argumentsList
+      ],
+      {
+        allowFailure: true,
+        cwd: resolvedRoot,
+        env: options.environment,
+        stdio: options.stdio ?? "inherit"
+      }
+    );
+  } finally {
+    rmSync2(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
 // src/ui/prompts.ts
 import {
   cancel,
@@ -2462,7 +2600,7 @@ import {
   select,
   text
 } from "@clack/prompts";
-import path12 from "path";
+import path13 from "path";
 import pc2 from "picocolors";
 function value(input) {
   if (isCancel(input)) {
@@ -2547,7 +2685,7 @@ async function branchPolicy(repository) {
 }
 async function promptWorkspaceManifest(directory) {
   intro(pc2.bgMagenta(pc2.white(" Agent Coordinator \xB7 new workspace ")));
-  const suggestedName = slug(path12.basename(path12.resolve(directory))) || "workspace";
+  const suggestedName = slug(path13.basename(path13.resolve(directory))) || "workspace";
   const name = value(
     await text({
       message: "Workspace name",
@@ -2639,7 +2777,7 @@ async function promptWorkspaceManifest(directory) {
   );
   const proceed = value(
     await confirm({
-      message: `Initialize ${name} in ${path12.resolve(directory)}?`,
+      message: `Initialize ${name} in ${path13.resolve(directory)}?`,
       initialValue: true
     })
   );
@@ -2650,7 +2788,7 @@ async function promptWorkspaceManifest(directory) {
   return {
     discoverSkills,
     manifest: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       name,
       remote: "origin",
       repositories,
@@ -2671,7 +2809,7 @@ async function promptDashboardAction() {
       message: "What would you like to do?",
       options: [
         { value: "status", label: "Refresh status" },
-        { value: "sync", label: "Synchronize Git, agents, skills, and CI" },
+        { value: "sync", label: "Synchronize agents, skills, and CI" },
         { value: "doctor", label: "Run workspace doctor" },
         { value: "exit", label: "Exit" }
       ]
@@ -2682,7 +2820,7 @@ async function promptDashboardAction() {
 // package.json
 var package_default = {
   name: "agent-coordinator",
-  version: "0.1.4",
+  version: "0.2.0",
   private: true,
   description: "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   type: "module",
@@ -2868,10 +3006,9 @@ import {
   existsSync as existsSync11,
   lstatSync as lstatSync3,
   mkdirSync as mkdirSync4,
-  readFileSync as readFileSync7,
   realpathSync as realpathSync3
 } from "fs";
-import path13 from "path";
+import path14 from "path";
 function repositoryCloneUrl(url) {
   return /^[^/:]+\/[^/]+$/.test(url) ? `git@github.com:${url}.git` : url;
 }
@@ -2897,7 +3034,7 @@ function canonicalPath(value2) {
   try {
     return realpathSync3(value2);
   } catch {
-    return path13.resolve(value2);
+    return path14.resolve(value2);
   }
 }
 function githubRepository(value2) {
@@ -2909,7 +3046,7 @@ function repositoryUrlsMatch(expectedInput, actualInput) {
   const expectedGithub = githubRepository(expected);
   const actualGithub = githubRepository(actualInput);
   if (expectedGithub && actualGithub) return expectedGithub === actualGithub;
-  if (path13.isAbsolute(expected) && path13.isAbsolute(actualInput)) {
+  if (path14.isAbsolute(expected) && path14.isAbsolute(actualInput)) {
     return canonicalPath(expected) === canonicalPath(actualInput);
   }
   return expected.replace(/\/+$/, "") === actualInput.replace(/\/+$/, "");
@@ -2951,7 +3088,7 @@ function configuredSubmodule(root, repository) {
   return { key, url: url.stdout };
 }
 function validateMaterializedRepository(root, repository) {
-  const repositoryDirectory = path13.join(root, repository.path);
+  const repositoryDirectory = path14.join(root, repository.path);
   if (!pathExists(repositoryDirectory)) {
     throw new CoordinatorError(
       `Repository '${repository.id}' is not materialized at '${repository.path}'.`,
@@ -3011,7 +3148,7 @@ function validateMaterializedRepository(root, repository) {
 }
 function validateExistingDestinations(root, manifest) {
   const existing = manifest.repositories.filter(
-    (repository) => pathExists(path13.join(root, repository.path))
+    (repository) => pathExists(path14.join(root, repository.path))
   );
   if (!existing.length) return;
   const topLevel = gitResult(root, ["rev-parse", "--show-toplevel"], true);
@@ -3026,7 +3163,7 @@ function validateExistingDestinations(root, manifest) {
   }
 }
 function coordinatorBranchForInitialization(root) {
-  if (!pathExists(path13.join(root, ".git"))) return "main";
+  if (!pathExists(path14.join(root, ".git"))) return "main";
   const current = gitResult(
     root,
     ["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -3105,33 +3242,26 @@ function resolveInitialBranches(root, manifest) {
   }
   return resolved;
 }
-function validateGeneratedConfiguration(root, manifest) {
-  const configurationPath = path13.join(root, ".git-coordinator.json");
-  if (!existsSync11(configurationPath)) {
-    throw new CoordinatorError(
-      "Workspace initialization did not produce Git configuration.",
-      "GIT_CONFIGURATION_MISSING"
-    );
-  }
-  let current;
+function validateNativeConfiguration(root, manifest) {
   try {
-    current = readFileSync7(configurationPath, "utf8");
+    const loaded = loadManifest(root);
+    if (JSON.stringify(loaded.manifest) !== JSON.stringify(manifest)) {
+      throw new CoordinatorError(
+        "Validated coordinator.yaml does not match the initialized workspace manifest.",
+        "GIT_CONFIGURATION_INVALID"
+      );
+    }
   } catch (error) {
+    if (error instanceof CoordinatorError) throw error;
     throw new CoordinatorError(
-      `Generated Git configuration could not be read: ${error instanceof Error ? error.message : String(error)}`,
-      "GIT_CONFIGURATION_INVALID"
-    );
-  }
-  if (current !== renderGitConfiguration(manifest)) {
-    throw new CoordinatorError(
-      "Generated .git-coordinator.json does not match the validated workspace manifest.",
+      `coordinator.yaml could not be validated as the native Git configuration: ${error instanceof Error ? error.message : String(error)}`,
       "GIT_CONFIGURATION_INVALID"
     );
   }
 }
 function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   const manifest = coordinatorManifestSchema.parse(input);
-  const root = path13.resolve(directory);
+  const root = path14.resolve(directory);
   const dryRun = options.dryRun ?? false;
   const force = options.force ?? false;
   const addSubmodules = options.addSubmodules ?? true;
@@ -3144,7 +3274,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   if (pathExists(root)) validateExistingDestinations(root, manifest);
   const initialBranches = resolveInitialBranches(root, manifest);
   const initiallyMissing = manifest.repositories.filter(
-    (repository) => !pathExists(path13.join(root, repository.path))
+    (repository) => !pathExists(path14.join(root, repository.path))
   );
   if (!addSubmodules && installHooks && initiallyMissing.length) {
     throw new CoordinatorError(
@@ -3153,7 +3283,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
     );
   }
   if (!existsSync11(root) && !dryRun) mkdirSync4(root, { recursive: true });
-  const gitDirectory = path13.join(root, ".git");
+  const gitDirectory = path14.join(root, ".git");
   const createdGitRepository = !existsSync11(gitDirectory);
   if (createdGitRepository && !dryRun) {
     mkdirSync4(root, { recursive: true });
@@ -3163,7 +3293,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   const added = [];
   if (addSubmodules && !dryRun) {
     for (const repository of manifest.repositories) {
-      const repositoryDirectory = path13.join(root, repository.path);
+      const repositoryDirectory = path14.join(root, repository.path);
       if (pathExists(repositoryDirectory)) continue;
       const initialBranch = initialBranches.get(repository.id);
       const branchArguments = initialBranch.existsOnRemote ? ["-b", initialBranch.name] : [];
@@ -3180,12 +3310,12 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
     }
   }
   const materialized = manifest.repositories.filter(
-    (repository) => pathExists(path13.join(root, repository.path))
+    (repository) => pathExists(path14.join(root, repository.path))
   );
   for (const repository of materialized) {
     validateMaterializedRepository(root, repository);
   }
-  const missingSubmodules = manifest.repositories.filter((repository) => !pathExists(path13.join(root, repository.path))).map((repository) => repository.id);
+  const missingSubmodules = manifest.repositories.filter((repository) => !pathExists(path14.join(root, repository.path))).map((repository) => repository.id);
   if (!dryRun && installHooks && missingSubmodules.length) {
     throw new CoordinatorError(
       `Cannot install Git integration because these declared submodules are not materialized: ${missingSubmodules.join(", ")}. No hooks, attach, or invariant check were run.`,
@@ -3196,7 +3326,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
     for (const repository of manifest.repositories) {
       if (repository.agent.skills.length) continue;
       repository.agent.skills = discoverSkillSources(
-        path13.join(root, repository.path)
+        path14.join(root, repository.path)
       ).map((source) => ({ source }));
     }
     const discoveredManifestPlan = planFile(
@@ -3208,7 +3338,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
     applyFilePlans([discoveredManifestPlan]);
   }
   const sync = dryRun ? null : synchronizeWorkspace(root, manifest, generatorVersion, { force });
-  if (!dryRun) validateGeneratedConfiguration(root, manifest);
+  if (!dryRun) validateNativeConfiguration(root, manifest);
   if (!dryRun && installHooks) {
     installGitRuntime(root, {}, gitStdio);
     invokeGitCoordinator("install", root, { stdio: gitStdio });
@@ -3218,7 +3348,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   const gitIntegration = dryRun ? {
     attached: false,
     configurationValidated: false,
-    detail: "Dry run only; no Git configuration, hooks, attach, or invariant check was applied.",
+    detail: "Dry run only; no Git integration, hooks, attach, or invariant check was applied.",
     hooksInstalled: false,
     invariantChecked: false,
     missingSubmodules: initiallyMissing.map((repository) => repository.id),
@@ -3227,7 +3357,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   } : installHooks ? {
     attached: true,
     configurationValidated: true,
-    detail: "Generated Git configuration, submodule topology, branch attachment, and Git Coordinator invariant validated.",
+    detail: "Native coordinator.yaml Git configuration, submodule topology, branch attachment, and Git Coordinator invariant validated.",
     hooksInstalled: true,
     invariantChecked: true,
     missingSubmodules: [],
@@ -3236,7 +3366,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   } : {
     attached: false,
     configurationValidated: true,
-    detail: "Configuration-only mode (--no-hooks): generated Git configuration and materialized submodules were validated; runtime bootstrap, hooks, attach, and the runtime invariant check were intentionally skipped.",
+    detail: "Configuration-only mode (--no-hooks): native coordinator.yaml Git configuration and materialized submodules were validated; runtime bootstrap, hooks, attach, and the runtime invariant check were intentionally skipped.",
     hooksInstalled: false,
     invariantChecked: false,
     missingSubmodules,
@@ -3253,8 +3383,8 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
 }
 
 // src/workspace/migrate.ts
-import { existsSync as existsSync12, readFileSync as readFileSync8 } from "fs";
-import path14 from "path";
+import { existsSync as existsSync12, readFileSync as readFileSync9 } from "fs";
+import path15 from "path";
 function slug2(value2) {
   return value2.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
@@ -3279,15 +3409,74 @@ function submoduleUrl(root, repositoryPath) {
     allowFailure: true
   }).stdout || repositoryPath;
 }
-function migrateLegacyWorkspace(rootInput) {
-  const root = path14.resolve(rootInput);
-  const configurationPath = path14.join(root, ".git-coordinator.json");
+function inlineWorkspace(root, legacy, repositories) {
+  const settings = legacy.workspaceManifest;
+  if (!settings || (settings.coordinatorToken ?? "$coordinator") !== "$coordinator") {
+    return null;
+  }
+  if (typeof settings.path !== "string" || !settings.path || settings.path === "." || path15.isAbsolute(settings.path) || settings.path.split(/[\\/]/).includes("..")) {
+    return null;
+  }
+  const normalizedWorkspacePath = path15.posix.normalize(
+    settings.path.replaceAll("\\", "/")
+  );
+  if (["coordinator.yaml", ".git-coordinator.json"].includes(
+    normalizedWorkspacePath
+  )) {
+    throw new CoordinatorError(
+      `Legacy workspaceManifest.path '${settings.path}' collides with a reserved coordinator file.`,
+      "INVALID_LEGACY_CONFIGURATION"
+    );
+  }
+  const workspacePath = path15.join(root, settings.path);
+  if (!existsSync12(workspacePath)) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync9(workspacePath, "utf8"));
+  } catch {
+    return null;
+  }
+  if (parsed.schemaVersion !== 1 || typeof parsed.baseBranch !== "string" || !parsed.baseBranch || !parsed.repositories || typeof parsed.repositories !== "object" || Array.isArray(parsed.repositories)) {
+    return null;
+  }
+  const entries = parsed.repositories;
+  const expectedIds = repositories.map((repository) => repository.id).sort();
+  const actualIds = Object.keys(entries).sort();
+  if (expectedIds.length !== actualIds.length || expectedIds.some((id, index) => id !== actualIds[index])) {
+    return null;
+  }
+  const selection = {};
+  for (const repository of repositories) {
+    const entry = entries[repository.id];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const candidate = entry;
+    if (Object.keys(candidate).sort().join(",") !== "branch,mode,path" || candidate.path !== repository.path || typeof candidate.branch !== "string" || !candidate.branch || !["active", "pinned"].includes(String(candidate.mode))) {
+      return null;
+    }
+    selection[repository.id] = {
+      branch: candidate.branch,
+      mode: candidate.mode
+    };
+  }
+  return {
+    embeddedWorkspacePath: settings.path,
+    workspace: {
+      baseBranch: parsed.baseBranch,
+      coordinatorToken: "$coordinator",
+      mirrorActiveInLinkedWorktrees: settings.mirrorActiveInLinkedWorktrees ?? false,
+      selection
+    }
+  };
+}
+function migrateLegacyWorkspaceWithMetadata(rootInput) {
+  const root = path15.resolve(rootInput);
+  const configurationPath = path15.join(root, ".git-coordinator.json");
   if (!existsSync12(configurationPath)) {
     throw new CoordinatorError(`${configurationPath} does not exist.`);
   }
   let legacy;
   try {
-    legacy = JSON.parse(readFileSync8(configurationPath, "utf8"));
+    legacy = JSON.parse(readFileSync9(configurationPath, "utf8"));
   } catch (error) {
     throw new CoordinatorError(
       `.git-coordinator.json is invalid: ${error instanceof Error ? error.message : String(error)}`
@@ -3301,23 +3490,25 @@ function migrateLegacyWorkspace(rootInput) {
     [".claude", "claude"],
     [".cursor", "cursor"],
     [".opencode", "opencode"]
-  ].filter(([directory]) => existsSync12(path14.join(root, directory))).map(([, tool]) => tool);
-  const manifest = {
-    schemaVersion: 1,
-    name: slug2(path14.basename(root)),
+  ].filter(([directory]) => existsSync12(path15.join(root, directory))).map(([, tool]) => tool);
+  const repositories = legacy.repositories.map((repository) => {
+    if (!repository.id || !repository.path) {
+      throw new CoordinatorError("Legacy repository entry is missing id or path.");
+    }
+    return {
+      id: repository.id,
+      path: repository.path,
+      url: submoduleUrl(root, repository.path),
+      branch: legacy.schemaVersion === 1 ? { mode: "mirror", readOnly: false } : repository.branch ?? { mode: "mirror", readOnly: false },
+      agent: { instructions: [], verify: [], skills: [] }
+    };
+  });
+  const embedded = inlineWorkspace(root, legacy, repositories);
+  const manifestInput = {
+    schemaVersion: embedded || !legacy.workspaceManifest ? 2 : 1,
+    name: slug2(path15.basename(root)),
     remote: legacy.remote ?? "origin",
-    repositories: legacy.repositories.map((repository) => {
-      if (!repository.id || !repository.path) {
-        throw new CoordinatorError("Legacy repository entry is missing id or path.");
-      }
-      return {
-        id: repository.id,
-        path: repository.path,
-        url: submoduleUrl(root, repository.path),
-        branch: legacy.schemaVersion === 1 ? { mode: "mirror", readOnly: false } : repository.branch ?? { mode: "mirror", readOnly: false },
-        agent: { instructions: [], verify: [], skills: [] }
-      };
-    }),
+    repositories,
     agents: {
       manage: false,
       tools: tools.length ? tools : ["codex"],
@@ -3325,7 +3516,7 @@ function migrateLegacyWorkspace(rootInput) {
       skillCollision: "namespace"
     }
   };
-  if (legacy.workspaceManifest) manifest.workspaceManifest = legacy.workspaceManifest;
+  const manifest = embedded ? { ...manifestInput, workspace: embedded.workspace } : legacy.workspaceManifest ? { ...manifestInput, workspaceManifest: legacy.workspaceManifest } : manifestInput;
   const validated = coordinatorManifestSchema.safeParse(manifest);
   if (!validated.success) {
     const issues = validated.error.issues.map((issue) => `${issue.path.join(".") || "coordinator.yaml"}: ${issue.message}`).join("\n");
@@ -3335,7 +3526,10 @@ ${issues}`,
       "INVALID_LEGACY_CONFIGURATION"
     );
   }
-  return validated.data;
+  return {
+    embeddedWorkspacePath: embedded?.embeddedWorkspacePath ?? null,
+    manifest: validated.data
+  };
 }
 
 // src/cli.ts
@@ -3455,7 +3649,8 @@ async function home(program2) {
     await showStatus(program2);
   }
 }
-var jsonRequested = process.argv.includes("--json");
+var directComposeArguments = process.argv[2] === "compose" ? process.argv.slice(3) : null;
+var jsonRequested = directComposeArguments === null && process.argv.includes("--json");
 var program = new Command();
 if (jsonRequested) {
   program.configureOutput({ writeErr: () => {
@@ -3477,8 +3672,8 @@ program.command("init").description("initialize a coordinator in an empty or exi
     discoverSkills = prompted.discoverSkills;
   } else {
     manifest = coordinatorManifestSchema.parse({
-      schemaVersion: 1,
-      name: options.name ?? slug3(path15.basename(path15.resolve(directory))),
+      schemaVersion: 2,
+      name: options.name ?? slug3(path16.basename(path16.resolve(directory))),
       remote: "origin",
       repositories: options.repo.map(repositoryFromSpec),
       agents: {
@@ -3497,7 +3692,7 @@ program.command("init").description("initialize a coordinator in an empty or exi
     force: options.force
   });
   if (options.dryRun) {
-    writeJson({ directory: path15.resolve(directory), manifest, discoverSkills, result });
+    writeJson({ directory: path16.resolve(directory), manifest, discoverSkills, result });
     return;
   }
   if (interactive) finishWorkspacePrompt();
@@ -3531,7 +3726,7 @@ program.command("demo").description("render a deterministic product dashboard").
 `);
 });
 program.command("doctor").description("validate the complete workspace contract").action(() => showDoctor(program));
-program.command("sync").description("synchronize Git, agent, skill, and CI outputs").option("--check", "fail when generated outputs are stale").option("--force", "adopt conflicting generated destinations").action((options) => {
+program.command("sync").description("synchronize agent, skill, and CI outputs and retire an owned legacy Git adapter").option("--check", "fail when generated outputs are stale").option("--force", "adopt conflicting generated destinations").action((options) => {
   const loaded = loadManifest();
   const result = synchronizeWorkspace(loaded.root, loaded.manifest, VERSION, options);
   const summary = summarizeChanges(result);
@@ -3630,6 +3825,11 @@ for (const command of ["install", "attach", "check"]) {
     if (result.status !== 0) process.exitCode = result.status;
   });
 }
+program.command("compose").description("run Docker Compose from the local.compose manifest configuration").argument("[args...]", "arguments forwarded to docker compose").allowUnknownOption(true).allowExcessArguments(true).helpOption(false).action((argumentsList) => {
+  const loaded = loadManifest();
+  const result = runLocalCompose(loaded.root, loaded.manifest, argumentsList);
+  if (result.status !== 0) process.exitCode = result.status;
+});
 program.command("install").description("install or refresh the transparent Git runtime on this machine").action(() => {
   const json = globals(program).json;
   const result = installGitRuntime(
@@ -3662,9 +3862,10 @@ program.command("update").description("check for or install the latest private r
 `);
   }
 });
-program.command("migrate").description("create coordinator.yaml from an existing .git-coordinator.json").argument("[directory]", "legacy workspace", ".").option("--write", "write coordinator.yaml instead of printing it").option("--adopt-git", "mark only the legacy Git configuration as coordinator-managed").option("--force", "replace an existing project-owned manifest").action((directory, options) => {
-  const root = path15.resolve(directory);
-  const manifest = migrateLegacyWorkspace(root);
+program.command("migrate").description("create coordinator.yaml from an existing .git-coordinator.json").argument("[directory]", "legacy workspace", ".").option("--write", "write coordinator.yaml instead of printing it").option("--adopt-git", "remove legacy Git files after absorbing their configuration").option("--force", "replace an existing project-owned manifest").action((directory, options) => {
+  const root = path16.resolve(directory);
+  const migration = migrateLegacyWorkspaceWithMetadata(root);
+  const manifest = migration.manifest;
   const content = renderManifest(manifest);
   if (!options.write) {
     if (options.adoptGit) {
@@ -3681,11 +3882,20 @@ program.command("migrate").description("create coordinator.yaml from an existing
     })
   ];
   if (options.adoptGit) {
+    if (!yamlNativeGitRuntimeActive(root)) {
+      throw new CoordinatorError(
+        "Refusing to remove legacy Git files before the YAML-native runtime is active. First run migrate --write, then coordinator git install, then retry with --write --adopt-git.",
+        "GIT_COORDINATOR_YAML_RUNTIME_REQUIRED"
+      );
+    }
     plans.push(
-      planFile(root, ".git-coordinator.json", renderGitConfiguration(manifest), {
-        force: true
-      })
+      planFileDeletion(root, ".git-coordinator.json", () => true)
     );
+    if (migration.embeddedWorkspacePath) {
+      plans.push(
+        planFileDeletion(root, migration.embeddedWorkspacePath, () => true)
+      );
+    }
   }
   applyFilePlans(plans);
   const result = plans.map((plan) => ({
@@ -3700,11 +3910,11 @@ program.command("migrate").description("create coordinator.yaml from an existing
       "Agent management remains disabled; existing agent and skill files were left untouched.\n"
     );
     process.stdout.write(
-      options.adoptGit ? "Next: review coordinator.yaml, then run coordinator sync, coordinator git install, coordinator git attach, and coordinator doctor.\n" : "Next: review coordinator.yaml, then rerun with --write --adopt-git to adopt only the Git adapter.\n"
+      options.adoptGit ? "Next: run coordinator git attach and coordinator doctor.\n" : "Next: review coordinator.yaml, run coordinator git install, then rerun with --write --adopt-git to remove the absorbed legacy Git files.\n"
     );
   }
 });
-program.parseAsync(process.argv).catch((error) => {
+function handleCliError(error) {
   if (error instanceof CommanderError) {
     if (error.exitCode === 0) return;
     if (jsonRequested) writeJson({ error: error.message, code: error.code });
@@ -3726,5 +3936,15 @@ program.parseAsync(process.argv).catch((error) => {
 `);
   }
   process.exitCode = 1;
-});
+}
+var execution = directComposeArguments ? Promise.resolve().then(() => {
+  const loaded = loadManifest();
+  const result = runLocalCompose(
+    loaded.root,
+    loaded.manifest,
+    directComposeArguments
+  );
+  if (result.status !== 0) process.exitCode = result.status;
+}) : program.parseAsync(process.argv);
+execution.catch(handleCliError);
 //# sourceMappingURL=cli.js.map

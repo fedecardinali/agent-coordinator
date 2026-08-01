@@ -18,6 +18,12 @@ const relativePath = z.string().min(1).refine(
   "must be a safe relative path",
 );
 
+const relativeDirectoryPath = z.string().min(1).refine(
+  (value) =>
+    !path.isAbsolute(value) && !value.split(/[\\/]/).includes(".."),
+  "must be a safe relative directory path",
+);
+
 const mirrorFallbackSchema = z.object({ mode: z.literal("mirror") });
 const fixedFallbackSchema = z.object({
   mode: z.literal("fixed"),
@@ -134,13 +140,51 @@ const workspaceManifestSchema = z.object({
   mirrorActiveInLinkedWorktrees: z.boolean().default(false),
 });
 
+const workspaceSelectionEntrySchema = z
+  .object({
+    branch: singleLine,
+    mode: z.enum(["active", "pinned"]),
+  })
+  .strict();
+
+const workspaceSchema = z
+  .object({
+    baseBranch: singleLine,
+    coordinatorToken: z.literal("$coordinator").default("$coordinator"),
+    mirrorActiveInLinkedWorktrees: z.boolean().default(false),
+    selection: z.record(identifier, workspaceSelectionEntrySchema),
+  })
+  .strict();
+
+const localComposeSchema = z
+  .object({
+    projectDirectory: relativeDirectoryPath,
+    files: z
+      .array(relativePath)
+      .min(1)
+      .refine(
+        (files) => new Set(files).size === files.length,
+        "must not contain duplicate Compose files",
+      ),
+    override: z.string().min(1),
+  })
+  .strict();
+
+const localSchema = z
+  .object({
+    compose: localComposeSchema.optional(),
+  })
+  .strict();
+
 export const coordinatorManifestSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.union([z.literal(1), z.literal(2)]),
     name: identifier,
     remote: z.string().min(1).default("origin"),
     repositories: z.array(repositorySchema).min(1),
     workspaceManifest: workspaceManifestSchema.optional(),
+    workspace: workspaceSchema.optional(),
+    local: localSchema.optional(),
     agents: agentsSchema.default({
       tools: ["codex"],
       maxParallel: 4,
@@ -149,6 +193,29 @@ export const coordinatorManifestSchema = z
     deployments: deploymentsSchema.optional(),
   })
   .superRefine((manifest, context) => {
+    if (manifest.schemaVersion === 1) {
+      if (manifest.workspace) {
+        context.addIssue({
+          code: "custom",
+          path: ["workspace"],
+          message: "requires schemaVersion 2",
+        });
+      }
+      if (manifest.local) {
+        context.addIssue({
+          code: "custom",
+          path: ["local"],
+          message: "requires schemaVersion 2",
+        });
+      }
+    } else if (manifest.workspaceManifest) {
+      context.addIssue({
+        code: "custom",
+        path: ["workspaceManifest"],
+        message: "is legacy schemaVersion 1 syntax; embed the selection in workspace",
+      });
+    }
+
     const ids = new Set<string>();
     const paths = new Set<string>();
     const agentNames = new Set<string>();
@@ -178,6 +245,28 @@ export const coordinatorManifestSchema = z
       ids.add(repository.id);
       paths.add(repository.path);
       agentNames.add(agentName);
+    }
+
+    if (manifest.workspace) {
+      const selectedIds = new Set(Object.keys(manifest.workspace.selection));
+      for (const repositoryId of ids) {
+        if (!selectedIds.has(repositoryId)) {
+          context.addIssue({
+            code: "custom",
+            path: ["workspace", "selection"],
+            message: `missing repository '${repositoryId}'`,
+          });
+        }
+      }
+      for (const repositoryId of selectedIds) {
+        if (!ids.has(repositoryId)) {
+          context.addIssue({
+            code: "custom",
+            path: ["workspace", "selection", repositoryId],
+            message: `unknown repository '${repositoryId}'`,
+          });
+        }
+      }
     }
 
     for (const [environmentName, environment] of Object.entries(

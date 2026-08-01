@@ -234,7 +234,7 @@ export async function promptWorkspaceManifest(
   return {
     discoverSkills,
     manifest: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       name,
       remote: "origin",
       repositories,
@@ -259,7 +259,7 @@ export async function promptDashboardAction(): Promise<
       message: "What would you like to do?",
       options: [
         { value: "status", label: "Refresh status" },
-        { value: "sync", label: "Synchronize Git, agents, skills, and CI" },
+        { value: "sync", label: "Synchronize agents, skills, and CI" },
         { value: "doctor", label: "Run workspace doctor" },
         { value: "exit", label: "Exit" },
       ],

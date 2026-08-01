@@ -28,9 +28,11 @@ function instructions(manifest: CoordinatorManifest, repository: Repository): st
         .map((command) => `- \`${command}\``)
         .join("\n")}`
     : "";
-  const workspaceMode = manifest.workspaceManifest
-    ? `\n\nBefore editing, read \`${manifest.workspaceManifest.path}\` from the current coordinator revision and confirm \`${repository.id}\` is active. If it is pinned, read-only, or absent, stop and report that constraint to the primary agent.`
-    : "";
+  const workspaceMode = manifest.workspace
+    ? `\n\nBefore editing, read \`workspace.selection.${repository.id}\` in \`coordinator.yaml\` from the current coordinator revision and confirm it is active. If it is pinned, read-only, or absent, stop and report that constraint to the primary agent.`
+    : manifest.workspaceManifest
+      ? `\n\nBefore editing, read \`${manifest.workspaceManifest.path}\` from the current coordinator revision and confirm \`${repository.id}\` is active. If it is pinned, read-only, or absent, stop and report that constraint to the primary agent.`
+      : "";
   return `Work only inside \`${repository.path}\`. Never edit the coordinator root${
     siblings ? ` or sibling repositories ${siblings}` : ""
   }.
@@ -113,12 +115,10 @@ ${instructions(manifest, repository)}
 
 export function renderRootAgents(manifest: CoordinatorManifest): string {
   const repositoryList = manifest.repositories
-    .map(
-      (repository) =>
-        `- \`${repository.id}\`: \`${repository.path}\` (${repository.branch.mode}${
-          repository.branch.readOnly ? ", read-only" : ""
-        }); delegate to the \`${agentName(repository)}\` project agent.`,
-    )
+    .map((repository) => {
+      const policy = `${repository.branch.mode}${repository.branch.readOnly ? ", read-only" : ""}`;
+      return `- \`${repository.id}\`: \`${repository.path}\` (${policy}); delegate to the \`${agentName(repository)}\` project agent.`;
+    })
     .join("\n");
   const verify = manifest.repositories
     .flatMap((repository) =>
@@ -127,9 +127,11 @@ export function renderRootAgents(manifest: CoordinatorManifest): string {
       ),
     )
     .join("\n");
-  const workspaceManifest = manifest.workspaceManifest
-    ? `\nA branch-scoped workspace manifest is stored at \`${manifest.workspaceManifest.path}\`. Read the version from the current coordinator HEAD before delegation. Only repositories marked active may receive implementation work; pinned or absent repositories must remain untouched even when their default policy is writable.\n`
-    : "";
+  const workspaceManifest = manifest.workspace
+    ? "\nBranch-scoped repository intent is stored in `workspace.selection` inside `coordinator.yaml`. Read it from the current coordinator HEAD before delegation. Only repositories marked active may receive implementation work; pinned or absent repositories must remain untouched even when their default policy is writable.\n"
+    : manifest.workspaceManifest
+      ? `\nA legacy branch-scoped workspace manifest is stored at \`${manifest.workspaceManifest.path}\`. Read the version from the current coordinator HEAD before delegation. Only repositories marked active may receive implementation work; pinned or absent repositories must remain untouched even when their default policy is writable.\n`
+      : "";
   return `<!-- ${AGENT_FILE_MARKER}. Edit coordinator.yaml and run coordinator agents sync. -->
 
 # ${manifest.name} Agent Guide

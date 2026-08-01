@@ -29,7 +29,7 @@ function manifest(
   },
 ): CoordinatorManifest {
   return coordinatorManifestSchema.parse({
-    schemaVersion: 1,
+    schemaVersion: 2,
     name: "invariant-fixture",
     repositories: [
       {
@@ -96,7 +96,7 @@ function fakeGitCoordinator(root: string): { engine: string; log: string } {
       "const [command, workspace] = process.argv.slice(2);",
       "const destination = process.env.AGENT_COORDINATOR_TEST_GIT_LOG;",
       'if (destination) appendFileSync(destination, `${command} ${workspace ?? ""}`.trimEnd() + "\\n");',
-      'if (["attach", "check"].includes(command) && !existsSync(path.join(workspace, ".git-coordinator.json"))) process.exit(17);',
+      'if (["attach", "check"].includes(command) && !existsSync(path.join(workspace, "coordinator.yaml"))) process.exit(17);',
       "if (process.env.AGENT_COORDINATOR_TEST_FAIL_GIT_COMMAND === command) process.exit(19);",
     ].join("\n"),
   );
@@ -225,7 +225,8 @@ test("--no-hooks with --no-submodules reports configuration-only validation", ()
   assert.equal(result.gitIntegration.configurationValidated, true);
   assert.deepEqual(result.gitIntegration.validatedSubmodules, []);
   assert.deepEqual(result.gitIntegration.missingSubmodules, ["backend"]);
-  assert.equal(existsSync(path.join(root, ".git-coordinator.json")), true);
+  assert.equal(existsSync(path.join(root, ".git-coordinator.json")), false);
+  assert.equal(existsSync(path.join(root, "coordinator.yaml")), true);
   assert.equal(existsSync(path.join(root, "api")), false);
 });
 

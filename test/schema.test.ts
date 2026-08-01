@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { parse } from "yaml";
-import { renderGitConfiguration } from "../src/git/configuration.js";
 import { coordinatorManifestSchema } from "../src/core/schema.js";
 import { renderManifest } from "../src/core/manifest.js";
 
-test("one manifest renders the compatible Git Coordinator contract", () => {
+test("schemaVersion 2 keeps Git and local development in one manifest", () => {
   const manifest = coordinatorManifestSchema.parse({
-    schemaVersion: 1,
+    schemaVersion: 2,
     name: "example-workspace",
     repositories: [
       {
@@ -23,19 +22,99 @@ test("one manifest renders the compatible Git Coordinator contract", () => {
         branch: { mode: "fixed", name: "main" },
       },
     ],
+    workspace: {
+      baseBranch: "main",
+      mirrorActiveInLinkedWorktrees: true,
+      selection: {
+        backend: { branch: "$coordinator", mode: "active" },
+        infra: { branch: "main", mode: "pinned" },
+      },
+    },
+    local: {
+      compose: {
+        projectDirectory: "api",
+        files: ["api/compose.yaml"],
+        override: "services:\n  app:\n    ports: !override\n      - '4000:3000'\n",
+      },
+    },
   });
 
   assert.equal(manifest.repositories[0]!.branch.readOnly, false);
   assert.equal(manifest.repositories[1]!.branch.readOnly, true);
-  const git = JSON.parse(renderGitConfiguration(manifest));
-  assert.equal(git.schemaVersion, 2);
-  assert.equal(git.generatedBy, "agent-coordinator");
-  assert.deepEqual(git.repositories[1].branch, {
-    mode: "fixed",
-    name: "main",
-    readOnly: true,
+  assert.equal(manifest.workspace?.coordinatorToken, "$coordinator");
+  const rendered = parse(renderManifest(manifest));
+  assert.deepEqual(rendered.repositories, manifest.repositories);
+  assert.deepEqual(rendered.workspace, manifest.workspace);
+  assert.equal(rendered.local.compose.override, manifest.local?.compose?.override);
+});
+
+test("inline workspace selection must contain exactly every repository id", () => {
+  const missing = coordinatorManifestSchema.safeParse({
+    schemaVersion: 2,
+    name: "missing-selection",
+    repositories: [
+      { id: "backend", path: "api", url: "org/api" },
+      { id: "frontend", path: "web", url: "org/web" },
+    ],
+    workspace: {
+      baseBranch: "main",
+      selection: {
+        backend: { branch: "$coordinator", mode: "active" },
+      },
+    },
   });
-  assert.deepEqual(parse(renderManifest(manifest)).repositories, manifest.repositories);
+  assert.equal(missing.success, false);
+  if (!missing.success) assert.match(missing.error.message, /missing repository 'frontend'/);
+
+  const unknown = coordinatorManifestSchema.safeParse({
+    schemaVersion: 2,
+    name: "unknown-selection",
+    repositories: [{ id: "backend", path: "api", url: "org/api" }],
+    workspace: {
+      baseBranch: "main",
+      selection: {
+        backend: { branch: "$coordinator", mode: "active" },
+        frontend: { branch: "main", mode: "pinned" },
+      },
+    },
+  });
+  assert.equal(unknown.success, false);
+  if (!unknown.success) assert.match(unknown.error.message, /unknown repository 'frontend'/);
+});
+
+test("legacy workspaceManifest remains readable only in schemaVersion 1", () => {
+  const legacy = coordinatorManifestSchema.safeParse({
+    schemaVersion: 1,
+    name: "legacy",
+    repositories: [{ id: "backend", path: "api", url: "org/api" }],
+    workspaceManifest: { path: "legacy.workspace.json" },
+  });
+  assert.equal(legacy.success, true);
+
+  const mixed = coordinatorManifestSchema.safeParse({
+    schemaVersion: 2,
+    name: "mixed",
+    repositories: [{ id: "backend", path: "api", url: "org/api" }],
+    workspaceManifest: { path: "legacy.workspace.json" },
+  });
+  assert.equal(mixed.success, false);
+  if (!mixed.success) assert.match(mixed.error.message, /legacy schemaVersion 1/);
+});
+
+test("local Compose paths must remain inside the workspace", () => {
+  const result = coordinatorManifestSchema.safeParse({
+    schemaVersion: 2,
+    name: "unsafe-compose",
+    repositories: [{ id: "backend", path: "api", url: "org/api" }],
+    local: {
+      compose: {
+        projectDirectory: "api",
+        files: ["../compose.yaml"],
+        override: "services: {}\n",
+      },
+    },
+  });
+  assert.equal(result.success, false);
 });
 
 test("deployment components must reference declared repositories", () => {

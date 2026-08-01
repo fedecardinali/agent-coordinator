@@ -4,7 +4,12 @@ import pc from "picocolors";
 import { synchronizeAgents } from "./agents/sync.js";
 import { synchronizeCi } from "./ci/sync.js";
 import { errorMessage, CoordinatorError } from "./core/errors.js";
-import { applyFilePlans, changedPlans, planFile } from "./core/files.js";
+import {
+  applyFilePlans,
+  changedPlans,
+  planFile,
+  planFileDeletion,
+} from "./core/files.js";
 import {
   findWorkspaceRoot,
   loadManifest,
@@ -19,10 +24,11 @@ import { runDoctor, type DoctorResult } from "./doctor/check.js";
 import {
   installGitRuntime,
   invokeGitCoordinator,
+  yamlNativeGitRuntimeActive,
 } from "./git/adapter.js";
-import { renderGitConfiguration } from "./git/configuration.js";
 import { inspectWorkspace, demoWorkspaceStatus } from "./status/inspect.js";
 import { renderDashboard } from "./ui/dashboard.js";
+import { runLocalCompose } from "./local/compose.js";
 import {
   finishWorkspacePrompt,
   promptDashboardAction,
@@ -31,7 +37,7 @@ import {
 import { VERSION } from "./version.js";
 import { applyUpdate, checkForUpdate } from "./update/check.js";
 import { initializeWorkspace, repositoryCloneUrl } from "./workspace/initialize.js";
-import { migrateLegacyWorkspace } from "./workspace/migrate.js";
+import { migrateLegacyWorkspaceWithMetadata } from "./workspace/migrate.js";
 import { synchronizeWorkspace } from "./workspace/sync.js";
 
 interface GlobalOptions {
@@ -178,7 +184,10 @@ async function home(program: Command): Promise<void> {
   }
 }
 
-const jsonRequested = process.argv.includes("--json");
+const directComposeArguments =
+  process.argv[2] === "compose" ? process.argv.slice(3) : null;
+const jsonRequested =
+  directComposeArguments === null && process.argv.includes("--json");
 const program = new Command();
 if (jsonRequested) {
   program.configureOutput({ writeErr: () => {} });
@@ -229,7 +238,7 @@ program
       discoverSkills = prompted.discoverSkills;
     } else {
       manifest = coordinatorManifestSchema.parse({
-        schemaVersion: 1,
+        schemaVersion: 2,
         name: options.name ?? slug(path.basename(path.resolve(directory))),
         remote: "origin",
         repositories: options.repo.map(repositoryFromSpec),
@@ -289,7 +298,7 @@ program.command("doctor").description("validate the complete workspace contract"
 
 program
   .command("sync")
-  .description("synchronize Git, agent, skill, and CI outputs")
+  .description("synchronize agent, skill, and CI outputs and retire an owned legacy Git adapter")
   .option("--check", "fail when generated outputs are stale")
   .option("--force", "adopt conflicting generated destinations")
   .action((options: { check?: boolean; force?: boolean }) => {
@@ -409,6 +418,19 @@ for (const command of ["install", "attach", "check"] as const) {
 }
 
 program
+  .command("compose")
+  .description("run Docker Compose from the local.compose manifest configuration")
+  .argument("[args...]", "arguments forwarded to docker compose")
+  .allowUnknownOption(true)
+  .allowExcessArguments(true)
+  .helpOption(false)
+  .action((argumentsList: string[]) => {
+    const loaded = loadManifest();
+    const result = runLocalCompose(loaded.root, loaded.manifest, argumentsList);
+    if (result.status !== 0) process.exitCode = result.status;
+  });
+
+program
   .command("install")
   .description("install or refresh the transparent Git runtime on this machine")
   .action(() => {
@@ -453,7 +475,7 @@ program
   .description("create coordinator.yaml from an existing .git-coordinator.json")
   .argument("[directory]", "legacy workspace", ".")
   .option("--write", "write coordinator.yaml instead of printing it")
-  .option("--adopt-git", "mark only the legacy Git configuration as coordinator-managed")
+  .option("--adopt-git", "remove legacy Git files after absorbing their configuration")
   .option("--force", "replace an existing project-owned manifest")
   .action((directory: string, options: {
     adoptGit?: boolean;
@@ -461,7 +483,8 @@ program
     force?: boolean;
   }) => {
     const root = path.resolve(directory);
-    const manifest = migrateLegacyWorkspace(root);
+    const migration = migrateLegacyWorkspaceWithMetadata(root);
+    const manifest = migration.manifest;
     const content = renderManifest(manifest);
     if (!options.write) {
       if (options.adoptGit) {
@@ -478,11 +501,20 @@ program
       }),
     ];
     if (options.adoptGit) {
+      if (!yamlNativeGitRuntimeActive(root)) {
+        throw new CoordinatorError(
+          "Refusing to remove legacy Git files before the YAML-native runtime is active. First run migrate --write, then coordinator git install, then retry with --write --adopt-git.",
+          "GIT_COORDINATOR_YAML_RUNTIME_REQUIRED",
+        );
+      }
       plans.push(
-        planFile(root, ".git-coordinator.json", renderGitConfiguration(manifest), {
-          force: true,
-        }),
+        planFileDeletion(root, ".git-coordinator.json", () => true),
       );
+      if (migration.embeddedWorkspacePath) {
+        plans.push(
+          planFileDeletion(root, migration.embeddedWorkspacePath, () => true),
+        );
+      }
     }
     applyFilePlans(plans);
     const result = plans.map((plan) => ({
@@ -497,13 +529,13 @@ program
       );
       process.stdout.write(
         options.adoptGit
-          ? "Next: review coordinator.yaml, then run coordinator sync, coordinator git install, coordinator git attach, and coordinator doctor.\n"
-          : "Next: review coordinator.yaml, then rerun with --write --adopt-git to adopt only the Git adapter.\n",
+          ? "Next: run coordinator git attach and coordinator doctor.\n"
+          : "Next: review coordinator.yaml, run coordinator git install, then rerun with --write --adopt-git to remove the absorbed legacy Git files.\n",
       );
     }
   });
 
-program.parseAsync(process.argv).catch((error: unknown) => {
+function handleCliError(error: unknown): void {
   if (error instanceof CommanderError) {
     if (error.exitCode === 0) return;
     if (jsonRequested) writeJson({ error: error.message, code: error.code });
@@ -524,4 +556,18 @@ program.parseAsync(process.argv).catch((error: unknown) => {
     process.stderr.write(`${pc.red("×")} ${errorMessage(error)}\n`);
   }
   process.exitCode = 1;
-});
+}
+
+const execution = directComposeArguments
+  ? Promise.resolve().then(() => {
+      const loaded = loadManifest();
+      const result = runLocalCompose(
+        loaded.root,
+        loaded.manifest,
+        directComposeArguments,
+      );
+      if (result.status !== 0) process.exitCode = result.status;
+    })
+  : program.parseAsync(process.argv);
+
+execution.catch(handleCliError);

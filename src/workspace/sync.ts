@@ -1,15 +1,15 @@
 import {
   applyFilePlans,
   changedPlans,
-  planFile,
+  planFileDeletion,
   type FilePlan,
 } from "../core/files.js";
 import type { CoordinatorManifest } from "../core/schema.js";
+import { yamlNativeGitRuntimeActive } from "../git/adapter.js";
 import { synchronizeAgents, type AgentSyncResult } from "../agents/sync.js";
 import { synchronizeCi, type CiSyncResult } from "../ci/sync.js";
 import {
   isOwnedGitConfiguration,
-  renderGitConfiguration,
 } from "../git/configuration.js";
 
 export interface WorkspaceSyncResult {
@@ -25,14 +25,8 @@ export function synchronizeWorkspace(
   generatorVersion: string,
   options: { check?: boolean | undefined; force?: boolean | undefined } = {},
 ): WorkspaceSyncResult {
-  const git = planFile(
-    root,
-    ".git-coordinator.json",
-    renderGitConfiguration(manifest),
-    {
-      force: options.force,
-      owned: isOwnedGitConfiguration,
-    },
+  const git = planFileDeletion(root, ".git-coordinator.json", (content) =>
+    yamlNativeGitRuntimeActive(root) && isOwnedGitConfiguration(content),
   );
   const previewOptions = { ...options, check: true };
   const previewAgents = synchronizeAgents(

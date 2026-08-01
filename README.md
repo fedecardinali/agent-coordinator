@@ -23,7 +23,7 @@
 
 Agent Coordinator turns a coordinator repository and its Git submodules into one
 intentional workspace. Describe each repository once in `coordinator.yaml`, then
-render the compatibility configuration required by Git Coordinator, the project
+let Git Coordinator read that manifest directly while rendering the project
 agents expected by your coding tools, committed skills, and coordinated GitHub
 Actions workflows.
 
@@ -58,10 +58,11 @@ Agent Coordinator gives those layers one source of truth:
 
 ```text
 coordinator.yaml
-├── .git-coordinator.json              → transparent multi-repository Git
+├── native Git + branch selection      → transparent multi-repository Git
+├── optional local Compose             → one-file development orchestration
 ├── AGENTS.md + tool-specific agents   → repository ownership and delegation
-├── .agents/skills + lockfile           → committed portable capabilities
-└── GitHub Actions workflows            → gitlink-aware deployment dispatch
+├── .agents/skills + lockfile          → committed portable capabilities
+└── GitHub Actions workflows           → gitlink-aware deployment dispatch
 ```
 
 Gitlinks remain the authoritative version lock. Agent Coordinator does not
@@ -106,7 +107,7 @@ installation from the private repository is also supported:
 ```sh
 gh auth setup-git
 npm install --global \
-  git+https://github.com/fedecardinali/agent-coordinator.git#v0.1.3
+  git+https://github.com/fedecardinali/agent-coordinator.git#v0.2.0
 ```
 
 ### Install the transparent Git runtime
@@ -158,7 +159,7 @@ git commit -m "Initialize coordinated workspace"
 ```
 
 `--no-hooks` is a configuration-only mode: it writes and validates the
-manifest, submodules, and generated Git adapter without bootstrapping the
+   manifest and submodules without bootstrapping the
 runtime, installing hooks, attaching branches, or running the runtime check.
 
 For automation or a non-interactive terminal, declare repositories explicitly:
@@ -187,7 +188,7 @@ coordinator init ~/Developer/acme-coordinator \
 back to it and should not be edited by hand.
 
 ```yaml
-schemaVersion: 1
+schemaVersion: 2
 name: market-intel
 remote: origin
 
@@ -224,6 +225,31 @@ repositories:
       mode: fixed
       name: main
       readOnly: true
+
+workspace:
+  baseBranch: main
+  mirrorActiveInLinkedWorktrees: true
+  selection:
+    backend:
+      branch: $coordinator
+      mode: active
+    frontend:
+      branch: $coordinator
+      mode: active
+    infra:
+      branch: main
+      mode: pinned
+
+local:
+  compose:
+    projectDirectory: services/backend
+    files:
+      - services/backend/compose.yaml
+    override: |
+      services:
+        app:
+          ports: !override
+            - '${BACKEND_PORT:-4000}:3000'
 
 agents:
   tools:
@@ -276,7 +302,6 @@ coordinator sync --check
 
 | Area | Generated output |
 |---|---|
-| Git | `.git-coordinator.json` |
 | Shared agent guidance | `AGENTS.md` |
 | Codex | `.codex/config.toml`, `.codex/agents/*.toml` |
 | Claude Code | `.claude/CLAUDE.md`, `.claude/agents/*.md`, `.claude/commands/<workspace>/*.md` |
@@ -289,14 +314,20 @@ Delivery files are generated only when the manifest declares `deployments`.
 Tool-specific files are generated only for tools listed under `agents.tools`
 and while `agents.manage` is not `false`.
 
+Git configuration is not generated: schema version 2 is consumed directly from
+`coordinator.yaml`. Synchronization removes an obsolete `.git-coordinator.json`
+only when its ownership marker proves that Agent Coordinator generated it and
+the workspace is already attached to the YAML-native runtime; unmanaged legacy
+files are preserved.
+
 Agent Coordinator marks every managed destination. It refuses to overwrite an
 unmanaged file unless it is explicitly adopted with `--force`.
 
 ## Transparent multi-repository Git
 
-Agent Coordinator renders the schema understood by Git Coordinator. Once the
-runtime and workspace integration are installed, commands from the coordinator
-root remain familiar:
+Git Coordinator reads `coordinator.yaml` directly. Once the runtime and
+workspace integration are installed, commands from the coordinator root remain
+familiar:
 
 ```sh
 git add .
@@ -334,6 +365,13 @@ branch:
   readOnly: false
 ```
 
+When `workspace` is present, its `selection` contains exactly one entry for
+every repository. That selection is versioned with each coordinator branch:
+`active` repositories participate in coordinated writes, while `pinned`
+repositories stay read-only at their gitlink. `$coordinator` resolves to the
+current coordinator branch. Legacy schema version 1 manifests with an external
+`workspaceManifest` remain readable during migration.
+
 Useful runtime commands are deliberately explicit:
 
 ```sh
@@ -345,6 +383,26 @@ coordinator git check     # validate the Git invariant
 Cross-repository pushes cannot be atomic. Git Coordinator publishes writable
 children before the root coordinator and reports partial progress if a later
 remote rejects its push.
+
+## Local Docker Compose
+
+An optional `local.compose` block keeps the coordinator-specific Compose
+override in the same manifest. Base files and the project directory are safe
+workspace-relative paths; the override is a literal Compose document, so tags
+such as `!override` and environment interpolation remain untouched.
+
+Forward any Compose arguments after the command name:
+
+```sh
+coordinator compose config
+coordinator compose up -d --build
+coordinator compose logs -f app
+coordinator compose down
+```
+
+The CLI writes the override to a private temporary file, invokes Docker with
+the declared base files in order, and removes the temporary file even when
+Docker fails. No standalone Compose override is generated or tracked.
 
 ## Repository-scoped agents and portable skills
 
@@ -457,7 +515,7 @@ doctor actions. In a non-interactive terminal it prints status and exits.
 - GitHub CLI installation and authentication status
 - Initialized child repositories
 - Child revisions matching root gitlinks
-- Up-to-date generated Git, agent, skill, and CI files
+- Native Git manifest compatibility and up-to-date agent, skill, and CI files
 - Git Coordinator availability and invariants
 
 ```sh
@@ -503,20 +561,28 @@ coordinator migrate
 Write the manifest after reviewing it:
 
 ```sh
+coordinator migrate --write
+coordinator git install
 coordinator migrate --write --adopt-git
 coordinator sync
-coordinator git install
 coordinator git attach
 coordinator doctor
 ```
 
-`--adopt-git` is deliberately granular: it converts only the already-reviewed
-`.git-coordinator.json` into the generated contract. It never grants permission
-to replace agent guides, skills, or CI files.
+`--adopt-git` is deliberately granular: after the preview has been reviewed,
+it removes the absorbed `.git-coordinator.json` and an external workspace
+manifest only when that workspace selection was safely embedded. It never
+grants permission to replace agent guides, skills, or CI files. Install the
+YAML-native Git runtime after writing the YAML and before removing the legacy
+adapter. A normal `coordinator sync` also preserves an owned adapter until that
+runtime is active for the workspace.
 
 Migration preserves the remote, repository paths, branch policies, and optional
-versioned workspace-manifest settings. It detects configured Codex, Claude,
-Cursor, and OpenCode directories when selecting initial tools.
+versioned workspace selection. A valid schema version 1 workspace JSON is
+embedded in schema version 2 YAML; an unreadable or incompatible pointer stays
+as legacy schema version 1 instead of being discarded. Migration also detects
+configured Codex, Claude, Cursor, and OpenCode directories when selecting
+initial tools.
 
 Migration does not infer deployment environments, agent instructions,
 verification commands, skill exports, or custom mappings such as a
@@ -538,7 +604,7 @@ need `--force`.
 | `coordinator init [directory]` | Initialize a workspace interactively or from `--repo` flags. Supports `--dry-run`, `--no-submodules`, `--no-hooks`, and `--force`. |
 | `coordinator status` | Render the current workspace dashboard. |
 | `coordinator doctor` | Validate tools, repositories, gitlinks, generated state, and Git runtime. |
-| `coordinator sync` | Synchronize Git, agents, skills, and optional CI/CD outputs. |
+| `coordinator sync` | Synchronize agents, skills, and optional CI/CD outputs; remove only an owned obsolete Git adapter. |
 | `coordinator sync --check` | Exit non-zero when any generated output is stale. |
 | `coordinator agents sync` | Materialize tool-specific agents and committed skills. |
 | `coordinator agents check` | Check agent and skill outputs without writing. |
@@ -547,9 +613,10 @@ need `--force`.
 | `coordinator git install` | Ensure the pinned machine runtime, then install Git Coordinator integration for the workspace. |
 | `coordinator git attach` | Attach policy-resolved repository branches. |
 | `coordinator git check` | Run the Git Coordinator invariant check. |
+| `coordinator compose [args...]` | Run Docker Compose from `local.compose`, forwarding all remaining arguments. |
 | `coordinator install` | Resolve or bootstrap the pinned Git Coordinator engine, then install its machine-wide runtime. |
 | `coordinator update [--apply]` | Check or explicitly apply the latest private release. |
-| `coordinator migrate [directory] [--write] [--adopt-git]` | Preview or write a manifest from legacy Git Coordinator configuration, with optional Git-only adoption. |
+| `coordinator migrate [directory] [--write] [--adopt-git]` | Preview or write a manifest from legacy Git Coordinator configuration, optionally removing safely absorbed legacy files. |
 | `coordinator demo` | Render deterministic sample status used by documentation assets. |
 
 Global output flags work across commands:

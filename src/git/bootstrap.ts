@@ -30,8 +30,8 @@ export interface BootstrappedGitCoordinator {
 export const PINNED_GIT_COORDINATOR: GitCoordinatorSource = {
   repository: "fedecardinali/git-coordinator",
   cloneUrl: "https://github.com/fedecardinali/git-coordinator.git",
-  // Retained by the immutable Git Coordinator v0.4.1 tag.
-  ref: "91cc23ab35009855c5ef733f8bb313169ce65355",
+  // Retained by the immutable Git Coordinator v0.5.0 tag.
+  ref: "3fa3eccc54fc7fd8a51a96fd6086ded88aca7ca1",
 };
 
 function environmentFor(

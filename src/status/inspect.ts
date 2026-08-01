@@ -48,14 +48,23 @@ function policyLabel(repository: Repository): string {
   return "mirror";
 }
 
-function inspectRepository(root: string, repository: Repository): RepositoryStatus {
+function inspectRepository(
+  root: string,
+  repository: Repository,
+  selection?: { branch: string; mode: "active" | "pinned" },
+): RepositoryStatus {
+  const readOnly = selection?.mode === "pinned" ||
+    (!selection && repository.branch.readOnly);
+  const policy = selection
+    ? `${selection.mode}:${selection.branch}`
+    : policyLabel(repository);
   const directory = path.join(root, repository.path);
   if (!existsSync(directory)) {
     return {
       id: repository.id,
       branch: "—",
-      policy: policyLabel(repository),
-      readOnly: repository.branch.readOnly,
+      policy,
+      readOnly,
       health: "blocked",
       state: "missing",
     };
@@ -66,10 +75,10 @@ function inspectRepository(root: string, repository: Repository): RepositoryStat
   return {
     id: repository.id,
     branch: branch ?? "detached",
-    policy: policyLabel(repository),
-    readOnly: repository.branch.readOnly,
-    health: detached && !repository.branch.readOnly ? "attention" : "ready",
-    state: dirty ? "modified" : repository.branch.readOnly ? "read-only" : "clean",
+    policy,
+    readOnly,
+    health: detached && !readOnly ? "attention" : "ready",
+    state: dirty ? "modified" : readOnly ? "read-only" : "clean",
   };
 }
 
@@ -79,7 +88,11 @@ export function inspectWorkspace(
   version: string,
 ): WorkspaceStatus {
   const repositories = manifest.repositories.map((repository) =>
-    inspectRepository(root, repository),
+    inspectRepository(
+      root,
+      repository,
+      manifest.workspace?.selection[repository.id],
+    ),
   );
   const rootBranch =
     gitText(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]) ?? "unborn";

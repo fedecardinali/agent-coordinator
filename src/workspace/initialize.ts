@@ -9,7 +9,7 @@ import path from "node:path";
 import { runCommand, type CommandResult } from "../core/command.js";
 import { CoordinatorError } from "../core/errors.js";
 import { applyFilePlans, planFile } from "../core/files.js";
-import { renderManifest } from "../core/manifest.js";
+import { loadManifest, renderManifest } from "../core/manifest.js";
 import {
   coordinatorManifestSchema,
   type CoordinatorManifest,
@@ -19,7 +19,6 @@ import {
   installGitRuntime,
   invokeGitCoordinator,
 } from "../git/adapter.js";
-import { renderGitConfiguration } from "../git/configuration.js";
 import { discoverSkillSources } from "../agents/skills.js";
 import { synchronizeWorkspace, type WorkspaceSyncResult } from "./sync.js";
 
@@ -356,29 +355,22 @@ function resolveInitialBranches(
   return resolved;
 }
 
-function validateGeneratedConfiguration(
+function validateNativeConfiguration(
   root: string,
   manifest: CoordinatorManifest,
 ): void {
-  const configurationPath = path.join(root, ".git-coordinator.json");
-  if (!existsSync(configurationPath)) {
-    throw new CoordinatorError(
-      "Workspace initialization did not produce Git configuration.",
-      "GIT_CONFIGURATION_MISSING",
-    );
-  }
-  let current: string;
   try {
-    current = readFileSync(configurationPath, "utf8");
+    const loaded = loadManifest(root);
+    if (JSON.stringify(loaded.manifest) !== JSON.stringify(manifest)) {
+      throw new CoordinatorError(
+        "Validated coordinator.yaml does not match the initialized workspace manifest.",
+        "GIT_CONFIGURATION_INVALID",
+      );
+    }
   } catch (error) {
+    if (error instanceof CoordinatorError) throw error;
     throw new CoordinatorError(
-      `Generated Git configuration could not be read: ${error instanceof Error ? error.message : String(error)}`,
-      "GIT_CONFIGURATION_INVALID",
-    );
-  }
-  if (current !== renderGitConfiguration(manifest)) {
-    throw new CoordinatorError(
-      "Generated .git-coordinator.json does not match the validated workspace manifest.",
+      `coordinator.yaml could not be validated as the native Git configuration: ${error instanceof Error ? error.message : String(error)}`,
       "GIT_CONFIGURATION_INVALID",
     );
   }
@@ -480,7 +472,7 @@ export function initializeWorkspace(
   const sync = dryRun
     ? null
     : synchronizeWorkspace(root, manifest, generatorVersion, { force });
-  if (!dryRun) validateGeneratedConfiguration(root, manifest);
+  if (!dryRun) validateNativeConfiguration(root, manifest);
   if (!dryRun && installHooks) {
     installGitRuntime(root, {}, gitStdio);
     invokeGitCoordinator("install", root, { stdio: gitStdio });
@@ -491,7 +483,7 @@ export function initializeWorkspace(
     ? {
         attached: false,
         configurationValidated: false,
-        detail: "Dry run only; no Git configuration, hooks, attach, or invariant check was applied.",
+        detail: "Dry run only; no Git integration, hooks, attach, or invariant check was applied.",
         hooksInstalled: false,
         invariantChecked: false,
         missingSubmodules: initiallyMissing.map((repository) => repository.id),
@@ -502,7 +494,7 @@ export function initializeWorkspace(
       ? {
           attached: true,
           configurationValidated: true,
-          detail: "Generated Git configuration, submodule topology, branch attachment, and Git Coordinator invariant validated.",
+          detail: "Native coordinator.yaml Git configuration, submodule topology, branch attachment, and Git Coordinator invariant validated.",
           hooksInstalled: true,
           invariantChecked: true,
           missingSubmodules: [],
@@ -513,7 +505,7 @@ export function initializeWorkspace(
           attached: false,
           configurationValidated: true,
           detail:
-            "Configuration-only mode (--no-hooks): generated Git configuration and materialized submodules were validated; runtime bootstrap, hooks, attach, and the runtime invariant check were intentionally skipped.",
+            "Configuration-only mode (--no-hooks): native coordinator.yaml Git configuration and materialized submodules were validated; runtime bootstrap, hooks, attach, and the runtime invariant check were intentionally skipped.",
           hooksInstalled: false,
           invariantChecked: false,
           missingSubmodules,

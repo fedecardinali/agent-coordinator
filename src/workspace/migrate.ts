@@ -18,6 +18,17 @@ interface LegacyConfiguration {
   workspaceManifest?: CoordinatorManifest["workspaceManifest"];
 }
 
+interface LegacyWorkspaceManifest {
+  baseBranch?: unknown;
+  repositories?: unknown;
+  schemaVersion?: unknown;
+}
+
+export interface LegacyWorkspaceMigration {
+  embeddedWorkspacePath: string | null;
+  manifest: CoordinatorManifest;
+}
+
 function slug(value: string): string {
   return value
     .toLowerCase()
@@ -49,7 +60,105 @@ function submoduleUrl(root: string, repositoryPath: string): string {
   }).stdout || repositoryPath;
 }
 
-export function migrateLegacyWorkspace(rootInput: string): CoordinatorManifest {
+function inlineWorkspace(
+  root: string,
+  legacy: LegacyConfiguration,
+  repositories: CoordinatorManifest["repositories"],
+): {
+  embeddedWorkspacePath: string;
+  workspace: NonNullable<CoordinatorManifest["workspace"]>;
+} | null {
+  const settings = legacy.workspaceManifest;
+  if (!settings || (settings.coordinatorToken ?? "$coordinator") !== "$coordinator") {
+    return null;
+  }
+  if (
+    typeof settings.path !== "string" ||
+    !settings.path ||
+    settings.path === "." ||
+    path.isAbsolute(settings.path) ||
+    settings.path.split(/[\\/]/).includes("..")
+  ) {
+    return null;
+  }
+  const normalizedWorkspacePath = path.posix.normalize(
+    settings.path.replaceAll("\\", "/"),
+  );
+  if (
+    ["coordinator.yaml", ".git-coordinator.json"].includes(
+      normalizedWorkspacePath,
+    )
+  ) {
+    throw new CoordinatorError(
+      `Legacy workspaceManifest.path '${settings.path}' collides with a reserved coordinator file.`,
+      "INVALID_LEGACY_CONFIGURATION",
+    );
+  }
+  const workspacePath = path.join(root, settings.path);
+  if (!existsSync(workspacePath)) return null;
+
+  let parsed: LegacyWorkspaceManifest;
+  try {
+    parsed = JSON.parse(readFileSync(workspacePath, "utf8")) as LegacyWorkspaceManifest;
+  } catch {
+    return null;
+  }
+  if (
+    parsed.schemaVersion !== 1 ||
+    typeof parsed.baseBranch !== "string" ||
+    !parsed.baseBranch ||
+    !parsed.repositories ||
+    typeof parsed.repositories !== "object" ||
+    Array.isArray(parsed.repositories)
+  ) {
+    return null;
+  }
+
+  const entries = parsed.repositories as Record<string, unknown>;
+  const expectedIds = repositories.map((repository) => repository.id).sort();
+  const actualIds = Object.keys(entries).sort();
+  if (
+    expectedIds.length !== actualIds.length ||
+    expectedIds.some((id, index) => id !== actualIds[index])
+  ) {
+    return null;
+  }
+
+  const selection: Record<string, { branch: string; mode: "active" | "pinned" }> = {};
+  for (const repository of repositories) {
+    const entry = entries[repository.id];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const candidate = entry as Record<string, unknown>;
+    if (
+      Object.keys(candidate).sort().join(",") !== "branch,mode,path" ||
+      candidate.path !== repository.path ||
+      typeof candidate.branch !== "string" ||
+      !candidate.branch ||
+      !["active", "pinned"].includes(String(candidate.mode))
+    ) {
+      return null;
+    }
+    selection[repository.id] = {
+      branch: candidate.branch,
+      mode: candidate.mode as "active" | "pinned",
+    };
+  }
+
+  return {
+    embeddedWorkspacePath: settings.path,
+    workspace: {
+      baseBranch: parsed.baseBranch,
+      coordinatorToken: "$coordinator",
+      mirrorActiveInLinkedWorktrees:
+        settings.mirrorActiveInLinkedWorktrees ?? false,
+      selection,
+    },
+  };
+}
+
+export function migrateLegacyWorkspaceWithMetadata(
+  rootInput: string,
+): LegacyWorkspaceMigration {
   const root = path.resolve(rootInput);
   const configurationPath = path.join(root, ".git-coordinator.json");
   if (!existsSync(configurationPath)) {
@@ -74,25 +183,27 @@ export function migrateLegacyWorkspace(rootInput: string): CoordinatorManifest {
   ] as const)
     .filter(([directory]) => existsSync(path.join(root, directory)))
     .map(([, tool]) => tool);
-  const manifest: CoordinatorManifest = {
-    schemaVersion: 1,
+  const repositories: CoordinatorManifest["repositories"] = legacy.repositories.map((repository) => {
+    if (!repository.id || !repository.path) {
+      throw new CoordinatorError("Legacy repository entry is missing id or path.");
+    }
+    return {
+      id: repository.id,
+      path: repository.path,
+      url: submoduleUrl(root, repository.path),
+      branch:
+        legacy.schemaVersion === 1
+          ? { mode: "mirror" as const, readOnly: false }
+          : (repository.branch ?? { mode: "mirror" as const, readOnly: false }),
+      agent: { instructions: [], verify: [], skills: [] },
+    };
+  });
+  const embedded = inlineWorkspace(root, legacy, repositories);
+  const manifestInput = {
+    schemaVersion: embedded || !legacy.workspaceManifest ? 2 : 1,
     name: slug(path.basename(root)),
     remote: legacy.remote ?? "origin",
-    repositories: legacy.repositories.map((repository) => {
-      if (!repository.id || !repository.path) {
-        throw new CoordinatorError("Legacy repository entry is missing id or path.");
-      }
-      return {
-        id: repository.id,
-        path: repository.path,
-        url: submoduleUrl(root, repository.path),
-        branch:
-          legacy.schemaVersion === 1
-            ? { mode: "mirror" as const, readOnly: false }
-            : (repository.branch ?? { mode: "mirror" as const, readOnly: false }),
-        agent: { instructions: [], verify: [], skills: [] },
-      };
-    }),
+    repositories,
     agents: {
       manage: false,
       tools: tools.length ? tools : ["codex"],
@@ -100,7 +211,11 @@ export function migrateLegacyWorkspace(rootInput: string): CoordinatorManifest {
       skillCollision: "namespace",
     },
   };
-  if (legacy.workspaceManifest) manifest.workspaceManifest = legacy.workspaceManifest;
+  const manifest = embedded
+    ? { ...manifestInput, workspace: embedded.workspace }
+    : legacy.workspaceManifest
+      ? { ...manifestInput, workspaceManifest: legacy.workspaceManifest }
+      : manifestInput;
   const validated = coordinatorManifestSchema.safeParse(manifest);
   if (!validated.success) {
     const issues = validated.error.issues
@@ -111,5 +226,12 @@ export function migrateLegacyWorkspace(rootInput: string): CoordinatorManifest {
       "INVALID_LEGACY_CONFIGURATION",
     );
   }
-  return validated.data;
+  return {
+    embeddedWorkspacePath: embedded?.embeddedWorkspacePath ?? null,
+    manifest: validated.data,
+  };
+}
+
+export function migrateLegacyWorkspace(rootInput: string): CoordinatorManifest {
+  return migrateLegacyWorkspaceWithMetadata(rootInput).manifest;
 }

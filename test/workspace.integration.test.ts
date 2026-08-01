@@ -27,7 +27,7 @@ test("init creates a Git-compatible workspace and materializes committed skills"
   const result = initializeWorkspace(
     root,
     {
-      schemaVersion: 1,
+      schemaVersion: 2,
       name: "product",
       remote: "origin",
       repositories: [
@@ -57,7 +57,8 @@ test("init creates a Git-compatible workspace and materializes committed skills"
   );
 
   assert.deepEqual(result.submodules, ["backend", "frontend"]);
-  assert.ok(existsSync(path.join(root, ".git-coordinator.json")));
+  assert.equal(existsSync(path.join(root, ".git-coordinator.json")), false);
+  assert.ok(existsSync(path.join(root, "coordinator.yaml")));
   assert.ok(existsSync(path.join(root, ".codex", "agents", "backend.toml")));
   assert.ok(existsSync(path.join(root, ".claude", "agents", "frontend.md")));
   assert.ok(existsSync(path.join(root, ".agents", "skills", "api-testing", "SKILL.md")));
@@ -76,7 +77,15 @@ test("init creates a Git-compatible workspace and materializes committed skills"
   assert.match(git(root, "submodule", "status"), /^[0-9a-f]{40} backend/m);
 
   const engine = path.resolve(import.meta.dirname, "../../git-coordinator/src/cli.mjs");
-  if (existsSync(engine)) {
+  const engineWrapper = path.resolve(
+    import.meta.dirname,
+    "../../git-coordinator/src/git-wrapper.mjs",
+  );
+  if (
+    existsSync(engine) &&
+    existsSync(engineWrapper) &&
+    readFileSync(engineWrapper, "utf8").includes("coordinator.yaml")
+  ) {
     execFileSync(process.execPath, [engine, "install", root]);
     const invariant = execFileSync(process.execPath, [engine, "check", root], {
       encoding: "utf8",
@@ -110,11 +119,26 @@ test("legacy Git Coordinator configuration migrates without changing it", (conte
     "0.1.0",
     { installHooks: false },
   );
-  const before = readFileSync(path.join(root, ".git-coordinator.json"), "utf8");
+  const configurationPath = path.join(root, ".git-coordinator.json");
+  writeFileSync(
+    configurationPath,
+    `${JSON.stringify({
+      schemaVersion: 2,
+      remote: "origin",
+      repositories: [
+        {
+          id: "backend",
+          path: "api",
+          branch: { mode: "mirror", readOnly: false },
+        },
+      ],
+    }, null, 2)}\n`,
+  );
+  const before = readFileSync(configurationPath, "utf8");
   const migrated = migrateLegacyWorkspace(root);
   assert.equal(migrated.repositories[0]!.id, "backend");
   assert.equal(migrated.repositories[0]!.url, child.remote);
-  assert.equal(readFileSync(path.join(root, ".git-coordinator.json"), "utf8"), before);
+  assert.equal(readFileSync(configurationPath, "utf8"), before);
 });
 
 test("agent sync removes stale generated adapters but preserves manual files", (context) => {
@@ -168,4 +192,47 @@ test("workspace sync preflights unmanaged files before writing other outputs", (
     /Refusing to overwrite unmanaged file 'AGENTS\.md'/,
   );
   assert.equal(existsSync(path.join(root, ".git-coordinator.json")), false);
+});
+
+test("workspace sync removes only an owned legacy Git adapter", (context) => {
+  const root = temporaryDirectory("agent-coordinator-native-git-");
+  context.after(() => rmSync(root, { recursive: true }));
+  git(root, "init", "--initial-branch=main");
+  const manifest = coordinatorManifestSchema.parse({
+    schemaVersion: 2,
+    name: "native-git",
+    repositories: [{ id: "backend", path: "api", url: "org/api" }],
+    agents: {
+      manage: false,
+      tools: ["codex"],
+      maxParallel: 1,
+      skillCollision: "namespace",
+    },
+  });
+  const adapter = path.join(root, ".git-coordinator.json");
+  writeFileSync(
+    adapter,
+    `${JSON.stringify({ generatedBy: "agent-coordinator" })}\n`,
+  );
+
+  const beforeRuntime = synchronizeWorkspace(root, manifest, "0.2.0", {
+    check: true,
+  });
+  assert.equal(beforeRuntime.changed, false);
+  assert.equal(beforeRuntime.git.action, "unchanged");
+  assert.equal(existsSync(adapter), true);
+
+  git(root, "config", "--local", "gitCoordinator.manifest", "coordinator.yaml");
+  const preview = synchronizeWorkspace(root, manifest, "0.2.0", {
+    check: true,
+  });
+  assert.equal(preview.changed, true);
+  assert.equal(preview.git.action, "delete");
+  synchronizeWorkspace(root, manifest, "0.2.0");
+  assert.equal(existsSync(adapter), false);
+
+  writeFileSync(adapter, '{"schemaVersion":2}\n');
+  const unmanaged = synchronizeWorkspace(root, manifest, "0.2.0");
+  assert.equal(unmanaged.git.action, "unchanged");
+  assert.equal(existsSync(adapter), true);
 });

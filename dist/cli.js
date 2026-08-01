@@ -2682,7 +2682,7 @@ async function promptDashboardAction() {
 // package.json
 var package_default = {
   name: "agent-coordinator",
-  version: "0.1.1",
+  version: "0.1.2",
   private: true,
   description: "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   type: "module",
@@ -2699,13 +2699,13 @@ var package_default = {
     node: ">=20.12.0"
   },
   scripts: {
-    build: "tsup",
+    compile: "tsup",
     dev: "tsx src/cli.ts",
     typecheck: "tsc --noEmit",
     test: "tsx --test test/**/*.test.ts",
     "check:dist": "git diff --exit-code -- dist",
-    check: "npm run typecheck && npm test && npm run build && npm run check:dist",
-    "demo:asset": "npm run build && node scripts/render-terminal-demo.mjs"
+    check: "npm run typecheck && npm test && npm run compile && npm run check:dist",
+    "demo:asset": "npm run compile && node scripts/render-terminal-demo.mjs"
   },
   dependencies: {
     "@clack/prompts": "^1.7.0",

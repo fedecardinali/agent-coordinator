@@ -21,7 +21,7 @@
   </g>
   <g font-family="Menlo, Monaco, Consolas, monospace" font-size="17">
     <text x="80" y="112" fill="#67e8f9" xml:space="preserve">$ coordinator</text>
-    <text x="80" y="139" fill="#c084fc" xml:space="preserve">╭ Agent Coordinator · market-intel ───────────────────────────────────v0.1.1 ╮</text>
+    <text x="80" y="139" fill="#c084fc" xml:space="preserve">╭ Agent Coordinator · market-intel ───────────────────────────────────v0.1.2 ╮</text>
     <text x="80" y="166" fill="#d8dee9" xml:space="preserve">│ branch  feature/MIQ-8-sentry-feedback                                      │</text>
     <text x="80" y="193" fill="#64748b" xml:space="preserve">├─ Repositories ─────────────────────────────────────────────────────────────┤</text>
     <text x="80" y="220" fill="#d8dee9" xml:space="preserve">│ ● backend      mirror        feature/MIQ-8-sentry-feedb… clean             │</text>

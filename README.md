@@ -106,7 +106,7 @@ installation from the private repository is also supported:
 ```sh
 gh auth setup-git
 npm install --global \
-  git+https://github.com/fedecardinali/agent-coordinator.git#v0.1.1
+  git+https://github.com/fedecardinali/agent-coordinator.git#v0.1.2
 ```
 
 ### Install the transparent Git runtime
@@ -612,7 +612,7 @@ npm run dev -- --help
 npm run dev -- demo
 npm run typecheck
 npm test
-npm run build
+npm run compile
 ```
 
 The CLI combines [Commander](https://github.com/tj/commander.js) for the

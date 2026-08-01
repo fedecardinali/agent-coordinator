@@ -84,7 +84,7 @@ export function runDoctor(
       if (result.status !== 0) return { detail: result.stderr || "unavailable", status: "warn" };
       const drift = result.stdout
         .split("\n")
-        .filter((line) => /^[+-U]/.test(line));
+        .filter((line) => /^(?:\+|-|U)/.test(line));
       return drift.length
         ? { detail: `${drift.length} submodule revisions differ from gitlinks`, status: "fail" }
         : { detail: "all initialized submodules match their gitlinks" };

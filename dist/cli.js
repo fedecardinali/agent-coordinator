@@ -2232,7 +2232,7 @@ function runDoctor(root, manifest, version) {
         env: { GIT_COORDINATOR_INTERNAL: "1" }
       });
       if (result.status !== 0) return { detail: result.stderr || "unavailable", status: "warn" };
-      const drift = result.stdout.split("\n").filter((line) => /^[+-U]/.test(line));
+      const drift = result.stdout.split("\n").filter((line) => /^(?:\+|-|U)/.test(line));
       return drift.length ? { detail: `${drift.length} submodule revisions differ from gitlinks`, status: "fail" } : { detail: "all initialized submodules match their gitlinks" };
     })
   );
@@ -2682,7 +2682,7 @@ async function promptDashboardAction() {
 // package.json
 var package_default = {
   name: "agent-coordinator",
-  version: "0.1.2",
+  version: "0.1.3",
   private: true,
   description: "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   type: "module",

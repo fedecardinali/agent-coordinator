@@ -167,7 +167,7 @@ function applyFilePlans(plans) {
     }
   }
 }
-function planFileDeletion(root, relativePath2, owned3) {
+function planFileDeletion(root, relativePath2, owned2) {
   const absolutePath = safeGeneratedPath(root, relativePath2);
   if (!existsSync(absolutePath)) {
     return registerPlan(root, {
@@ -179,7 +179,7 @@ function planFileDeletion(root, relativePath2, owned3) {
   }
   const current = readFileSync(absolutePath, "utf8");
   return registerPlan(root, {
-    action: owned3(current) ? "delete" : "unchanged",
+    action: owned2(current) ? "delete" : "unchanged",
     content: current,
     path: absolutePath,
     relativePath: relativePath2
@@ -1597,11 +1597,6 @@ function deploymentConfiguration(manifest) {
     )
   };
 }
-function renderDeploymentConfiguration(manifest) {
-  const configuration = deploymentConfiguration(manifest);
-  return configuration ? `${JSON.stringify(configuration, null, 2)}
-` : null;
-}
 function planOutputs(componentNames) {
   return componentNames.flatMap((name) => {
     const key = outputKey(name);
@@ -1770,10 +1765,10 @@ ${forceEnvironment(componentNames)}
             echo "::error::${deployments.tokenSecret} is required"
             exit 1
           }
-          node .coordinator/runtime/deployment-plan.mjs \\
-            .coordinator/deployments.json ${shellQuote(environmentName)}
+          node .coordinator/runtime/deployment-plan.mjs ${shellQuote(environmentName)}
 ${triggerJobs}`;
 }
+var DEPLOYMENT_CONFIGURATION_PLACEHOLDER = "/* @agent-coordinator:deployment-configuration */ null";
 function loadPlannerTemplate() {
   const candidates = [
     path6.resolve(import.meta.dirname, "../../templates/deployment-plan.mjs"),
@@ -1785,19 +1780,45 @@ function loadPlannerTemplate() {
   }
   return readFileSync5(template, "utf8");
 }
+function renderDeploymentPlanner(manifest) {
+  const configuration = deploymentConfiguration(manifest);
+  if (!configuration) return null;
+  const template = loadPlannerTemplate();
+  const first = template.indexOf(DEPLOYMENT_CONFIGURATION_PLACEHOLDER);
+  if (first < 0 || first !== template.lastIndexOf(DEPLOYMENT_CONFIGURATION_PLACEHOLDER)) {
+    throw new CoordinatorError(
+      "Bundled deployment planner has an invalid configuration placeholder."
+    );
+  }
+  return template.replace(
+    DEPLOYMENT_CONFIGURATION_PLACEHOLDER,
+    `/* @agent-coordinator:deployment-configuration */ ${JSON.stringify(configuration, null, 2)}`
+  );
+}
 
 // src/ci/sync.ts
-function owned2(content) {
-  return content.includes(CI_MARKER) || content.includes('"generatedBy": "agent-coordinator"') || content.includes("export async function buildDeploymentPlan");
+function workflowOwned(content) {
+  return content.includes(CI_MARKER);
+}
+function plannerOwned(content) {
+  return content.includes("export async function buildDeploymentPlan");
+}
+function legacyDeploymentConfigurationOwned(content) {
+  try {
+    const parsed = JSON.parse(content);
+    return typeof parsed === "object" && parsed !== null && "generatedBy" in parsed && parsed.generatedBy === "agent-coordinator";
+  } catch {
+    return false;
+  }
 }
 function generatedCiPaths(root) {
   const paths = [];
-  for (const relativePath2 of [
-    ".coordinator/deployments.json",
-    ".coordinator/runtime/deployment-plan.mjs"
+  for (const [relativePath2, isOwned] of [
+    [".coordinator/deployments.json", legacyDeploymentConfigurationOwned],
+    [".coordinator/runtime/deployment-plan.mjs", plannerOwned]
   ]) {
     const absolutePath = path7.join(root, relativePath2);
-    if (existsSync6(absolutePath) && owned2(readFileSync6(absolutePath, "utf8"))) {
+    if (existsSync6(absolutePath) && isOwned(readFileSync6(absolutePath, "utf8"))) {
       paths.push(relativePath2);
     }
   }
@@ -1806,7 +1827,7 @@ function generatedCiPaths(root) {
     for (const entry of readdirSync3(workflows, { withFileTypes: true })) {
       if (!entry.isFile()) continue;
       const relativePath2 = path7.posix.join(".github/workflows", entry.name);
-      if (owned2(readFileSync6(path7.join(root, relativePath2), "utf8"))) {
+      if (workflowOwned(readFileSync6(path7.join(root, relativePath2), "utf8"))) {
         paths.push(relativePath2);
       }
     }
@@ -1818,29 +1839,24 @@ function synchronizeCi(root, manifest, options = {}) {
   const files = manifest.deployments ? [
     planFile(
       root,
-      ".coordinator/deployments.json",
-      renderDeploymentConfiguration(manifest),
-      { force, owned: owned2 }
-    ),
-    planFile(
-      root,
       ".coordinator/runtime/deployment-plan.mjs",
-      loadPlannerTemplate(),
-      { force, owned: (content) => content.includes("buildDeploymentPlan") }
+      renderDeploymentPlanner(manifest),
+      { force, owned: plannerOwned }
     ),
     ...Object.keys(manifest.deployments.environments).map(
       (environment) => planFile(
         root,
         `.github/workflows/coordinator-deploy-${environment}.yml`,
         renderEnvironmentWorkflow(manifest, environment),
-        { force, owned: owned2 }
+        { force, owned: workflowOwned }
       )
     )
   ] : [];
   const desiredPaths = new Set(files.map((file) => file.relativePath));
   for (const stalePath of generatedCiPaths(root)) {
     if (!desiredPaths.has(stalePath)) {
-      files.push(planFileDeletion(root, stalePath, owned2));
+      const isOwned = stalePath === ".coordinator/deployments.json" ? legacyDeploymentConfigurationOwned : stalePath === ".coordinator/runtime/deployment-plan.mjs" ? plannerOwned : workflowOwned;
+      files.push(planFileDeletion(root, stalePath, isOwned));
     }
   }
   const changed = changedPlans(files).length > 0;
@@ -2820,7 +2836,7 @@ async function promptDashboardAction() {
 // package.json
 var package_default = {
   name: "agent-coordinator",
-  version: "0.2.0",
+  version: "0.2.1",
   private: true,
   description: "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   type: "module",

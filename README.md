@@ -107,7 +107,7 @@ installation from the private repository is also supported:
 ```sh
 gh auth setup-git
 npm install --global \
-  git+https://github.com/fedecardinali/agent-coordinator.git#v0.2.0
+  git+https://github.com/fedecardinali/agent-coordinator.git#v0.2.1
 ```
 
 ### Install the transparent Git runtime
@@ -308,9 +308,14 @@ coordinator sync --check
 | Cursor | `.cursor/agents/*.md` |
 | OpenCode | `.opencode/agents/*.md` |
 | Portable skills | `.agents/skills/*`, `.coordinator/agents.lock.json` |
-| Delivery | `.coordinator/deployments.json`, `.coordinator/runtime/deployment-plan.mjs`, `.github/workflows/coordinator-deploy-*.yml` |
+| Delivery | `.coordinator/runtime/deployment-plan.mjs`, `.github/workflows/coordinator-deploy-*.yml` |
 
 Delivery files are generated only when the manifest declares `deployments`.
+The planner embeds the normalized deployment configuration derived from
+`coordinator.yaml`; no second deployment manifest is generated or edited.
+Synchronization removes the obsolete `.coordinator/deployments.json` only
+when its ownership marker proves that Agent Coordinator generated it, and
+preserves an unmanaged file at that path.
 Tool-specific files are generated only for tools listed under `agents.tools`
 and while `agents.manage` is not `false`.
 
@@ -464,14 +469,15 @@ workflow owned by each child repository.
 
 For each configured environment, the generated planner:
 
-1. Reads the exact child SHA from the coordinator commit's gitlink.
-2. Observes the latest child state from either workflow runs or GitHub
+1. Uses the deployment contract embedded from `coordinator.yaml`.
+2. Reads the exact child SHA from the coordinator commit's gitlink.
+3. Observes the latest child state from either workflow runs or GitHub
    Deployments.
-3. Skips a revision that is already successfully deployed.
-4. Avoids duplicating an active run for the desired revision and blocks when a
+4. Skips a revision that is already successfully deployed.
+5. Avoids duplicating an active run for the desired revision and blocks when a
    different revision is active.
-5. Dispatches the configured child workflow when a new run is required.
-6. Verifies that GitHub started the child run at the exact desired SHA.
+6. Dispatches the configured child workflow when a new run is required.
+7. Verifies that GitHub started the child run at the exact desired SHA.
 
 Generate or verify delivery files with:
 
@@ -719,7 +725,7 @@ src/core/        manifest validation, file planning, errors, commands
 src/workspace/   initialization, synchronization, legacy migration
 src/git/         pinned Git Coordinator bootstrap and compatibility adapter
 src/agents/      project-agent renderers and committed skill materialization
-src/ci/          deployment configuration and GitHub Actions generation
+src/ci/          embedded deployment runtime and GitHub Actions generation
 src/status/      workspace inspection
 src/doctor/      health checks
 src/update/      private release checks and explicit updates

@@ -9,6 +9,9 @@ const ACTIVE_STATES = new Set([
   "in_progress",
 ]);
 
+const EMBEDDED_CONFIGURATION =
+  /* @agent-coordinator:deployment-configuration */ null;
+
 function assertSha(value, label) {
   if (!/^[0-9a-f]{40}$/.test(value ?? "")) {
     throw new Error(`${label} must be a full Git commit SHA`);
@@ -265,15 +268,35 @@ async function writeGithubFiles(plan) {
   );
 }
 
-async function main() {
-  const configPath = process.argv[2];
-  const environment = process.argv[3];
-  if (!configPath || !environment) {
-    throw new Error("Usage: deployment-plan.mjs <config.json> <environment>");
+export async function resolveInvocation(
+  args,
+  embeddedConfiguration = EMBEDDED_CONFIGURATION,
+) {
+  if (args.length === 1) {
+    if (!embeddedConfiguration) {
+      throw new Error(
+        "This planner runtime has no embedded deployment configuration; use the legacy <config.json> <environment> invocation",
+      );
+    }
+    return { config: embeddedConfiguration, environment: args[0] };
   }
-  const config = JSON.parse(await readFile(configPath, "utf8"));
+  if (args.length === 2) {
+    return {
+      config: JSON.parse(await readFile(args[0], "utf8")),
+      environment: args[1],
+    };
+  }
+  throw new Error(
+    "Usage: deployment-plan.mjs <environment> (legacy: deployment-plan.mjs <config.json> <environment>)",
+  );
+}
+
+async function main() {
+  const { config, environment } = await resolveInvocation(process.argv.slice(2));
+  const components = config.environments?.[environment]?.components;
+  if (!components) throw new Error(`Unknown environment: ${environment}`);
   const force = Object.fromEntries(
-    Object.keys(config.environments[environment].components).map((name) => [
+    Object.keys(components).map((name) => [
       name,
       process.env[`FORCE_${outputKey(name).toUpperCase()}`],
     ]),

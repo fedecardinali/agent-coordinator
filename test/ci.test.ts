@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { parse } from "yaml";
 import { coordinatorManifestSchema } from "../src/core/schema.js";
 import {
   deploymentConfiguration,
+  renderDeploymentPlanner,
   renderEnvironmentWorkflow,
 } from "../src/ci/render.js";
 import { synchronizeCi } from "../src/ci/sync.js";
@@ -66,6 +74,8 @@ test("CI generator emits one skippable job per configured component", () => {
     parsed.jobs.plan.steps[2].env.PREFERRED_REF_TYPE,
     "${{ github.ref_type }}",
   );
+  assert.match(parsed.jobs.plan.steps[2].run, /deployment-plan\.mjs 'staging'/);
+  assert.doesNotMatch(parsed.jobs.plan.steps[2].run, /deployments\.json/);
 
   const actionlint = "/opt/homebrew/bin/actionlint";
   if (existsSync(actionlint)) {
@@ -78,6 +88,60 @@ test("CI generator emits one skippable job per configured component", () => {
       rmSync(temporary, { recursive: true });
     }
   }
+});
+
+test("generated planner embeds the deployment configuration", async (context) => {
+  const root = temporaryDirectory("agent-coordinator-ci-runtime-");
+  context.after(() => rmSync(root, { recursive: true }));
+  const manifest = coordinatorManifestSchema.parse({
+    schemaVersion: 1,
+    name: "product",
+    repositories: [
+      { id: "backend", path: "api", url: "consultr-inc/api" },
+    ],
+    deployments: {
+      environments: {
+        staging: {
+          githubEnvironment: "staging",
+          components: {
+            backend: {
+              repository: "backend",
+              workflow: "deploy.yml",
+              state: { provider: "workflow-runs" },
+            },
+          },
+        },
+      },
+    },
+  });
+
+  const rendered = renderDeploymentPlanner(manifest);
+  assert.ok(rendered);
+  assert.match(rendered, /"generatedBy": "agent-coordinator"/);
+  assert.doesNotMatch(
+    rendered,
+    /@agent-coordinator:deployment-configuration \*\/ null/,
+  );
+
+  synchronizeCi(root, manifest);
+  const runtimePath = path.join(
+    root,
+    ".coordinator/runtime/deployment-plan.mjs",
+  );
+  assert.equal(existsSync(runtimePath), true);
+  assert.equal(
+    existsSync(path.join(root, ".coordinator/deployments.json")),
+    false,
+  );
+  const runtime = await import(
+    `${pathToFileURL(runtimePath).href}?test=${Date.now()}`,
+  );
+  const invocation = await runtime.resolveInvocation(["staging"]);
+  assert.equal(invocation.environment, "staging");
+  assert.equal(
+    invocation.config.environments.staging.components.backend.githubRepository,
+    "consultr-inc/api",
+  );
 });
 
 test("deployment planner distinguishes current, running, and blocked states", async () => {
@@ -109,6 +173,47 @@ test("deployment planner distinguishes current, running, and blocked states", as
   assert.equal(planner.branchMatches("feature/*", "feature/demo"), true);
   assert.equal(planner.branchMatches("feature/*", "feature/team/demo"), false);
   assert.equal(planner.branchMatches("feature/**", "feature/team/demo"), true);
+});
+
+test("deployment planner preserves the legacy JSON invocation", async (context) => {
+  const root = temporaryDirectory("agent-coordinator-ci-legacy-");
+  context.after(() => rmSync(root, { recursive: true }));
+  const configPath = path.join(root, "deployments.json");
+  const config = {
+    environments: {
+      staging: {
+        components: {},
+      },
+    },
+  };
+  writeFileSync(configPath, JSON.stringify(config));
+  // @ts-expect-error The generated runtime is intentionally dependency-free JavaScript.
+  const planner = await import("../templates/deployment-plan.mjs");
+
+  const invocation = await planner.resolveInvocation([configPath, "staging"]);
+  assert.deepEqual(invocation, { config, environment: "staging" });
+  const output = execFileSync(
+    process.execPath,
+    [path.resolve("templates/deployment-plan.mjs"), configPath, "staging"],
+    {
+      cwd: path.resolve("."),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PREFERRED_REF: "main",
+        PREFERRED_REF_TYPE: "branch",
+      },
+    },
+  );
+  assert.deepEqual(JSON.parse(output), {
+    schemaVersion: 1,
+    environment: "staging",
+    components: {},
+  });
+  await assert.rejects(
+    planner.resolveInvocation(["staging"]),
+    /no embedded deployment configuration/,
+  );
 });
 
 test("workflow observation scans 100 runs and prioritizes an active run", async () => {
@@ -210,4 +315,55 @@ test("CI sync removes stale generated files but preserves manual workflows", (co
     false,
   );
   assert.equal(existsSync(manualWorkflow), true);
+});
+
+test("CI sync retires only an owned legacy deployment JSON", (context) => {
+  const root = temporaryDirectory("agent-coordinator-ci-legacy-cleanup-");
+  context.after(() => rmSync(root, { recursive: true }));
+  const manifest = coordinatorManifestSchema.parse({
+    schemaVersion: 1,
+    name: "product",
+    repositories: [
+      { id: "backend", path: "api", url: "consultr-inc/api" },
+    ],
+    deployments: {
+      environments: {
+        staging: {
+          githubEnvironment: "staging",
+          components: {
+            backend: {
+              repository: "backend",
+              workflow: "deploy.yml",
+              state: { provider: "workflow-runs" },
+            },
+          },
+        },
+      },
+    },
+  });
+  const legacyPath = path.join(root, ".coordinator/deployments.json");
+  mkdirSync(path.dirname(legacyPath), { recursive: true });
+  const unmanaged = '{"generatedBy":"somebody-else","keep":true}\n';
+  writeFileSync(legacyPath, unmanaged);
+
+  synchronizeCi(root, manifest);
+  assert.equal(readFileSync(legacyPath, "utf8"), unmanaged);
+
+  writeFileSync(
+    legacyPath,
+    '{"schemaVersion":1,"generatedBy":"agent-coordinator"}\n',
+  );
+  const preview = synchronizeCi(root, manifest, { check: true });
+  assert.equal(
+    preview.files.some(
+      (file) =>
+        file.relativePath === ".coordinator/deployments.json" &&
+        file.action === "delete",
+    ),
+    true,
+  );
+  assert.equal(existsSync(legacyPath), true);
+
+  synchronizeCi(root, manifest);
+  assert.equal(existsSync(legacyPath), false);
 });

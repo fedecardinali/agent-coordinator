@@ -63,11 +63,6 @@ export function deploymentConfiguration(manifest: CoordinatorManifest): object |
   };
 }
 
-export function renderDeploymentConfiguration(manifest: CoordinatorManifest): string | null {
-  const configuration = deploymentConfiguration(manifest);
-  return configuration ? `${JSON.stringify(configuration, null, 2)}\n` : null;
-}
-
 function planOutputs(componentNames: string[]): string {
   return componentNames
     .flatMap((name) => {
@@ -256,12 +251,14 @@ ${forceEnvironment(componentNames)}
             echo "::error::${deployments.tokenSecret} is required"
             exit 1
           }
-          node .coordinator/runtime/deployment-plan.mjs \\
-            .coordinator/deployments.json ${shellQuote(environmentName)}
+          node .coordinator/runtime/deployment-plan.mjs ${shellQuote(environmentName)}
 ${triggerJobs}`;
 }
 
-export function loadPlannerTemplate(): string {
+const DEPLOYMENT_CONFIGURATION_PLACEHOLDER =
+  "/* @agent-coordinator:deployment-configuration */ null";
+
+function loadPlannerTemplate(): string {
   const candidates = [
     path.resolve(import.meta.dirname, "../../templates/deployment-plan.mjs"),
     path.resolve(import.meta.dirname, "../templates/deployment-plan.mjs"),
@@ -271,4 +268,25 @@ export function loadPlannerTemplate(): string {
     throw new CoordinatorError("Bundled deployment planner template is missing.");
   }
   return readFileSync(template, "utf8");
+}
+
+export function renderDeploymentPlanner(
+  manifest: CoordinatorManifest,
+): string | null {
+  const configuration = deploymentConfiguration(manifest);
+  if (!configuration) return null;
+  const template = loadPlannerTemplate();
+  const first = template.indexOf(DEPLOYMENT_CONFIGURATION_PLACEHOLDER);
+  if (
+    first < 0 ||
+    first !== template.lastIndexOf(DEPLOYMENT_CONFIGURATION_PLACEHOLDER)
+  ) {
+    throw new CoordinatorError(
+      "Bundled deployment planner has an invalid configuration placeholder.",
+    );
+  }
+  return template.replace(
+    DEPLOYMENT_CONFIGURATION_PLACEHOLDER,
+    `/* @agent-coordinator:deployment-configuration */ ${JSON.stringify(configuration, null, 2)}`,
+  );
 }

@@ -85,22 +85,14 @@ function withEnvironment<T>(
   }
 }
 
-function fakeGitCoordinator(root: string): { engine: string; log: string } {
-  const engine = path.join(root, "fake-git-coordinator.mjs");
-  const log = path.join(root, "git-coordinator.log");
-  writeFileSync(
-    engine,
-    [
-      'import { appendFileSync, existsSync } from "node:fs";',
-      'import path from "node:path";',
-      "const [command, workspace] = process.argv.slice(2);",
-      "const destination = process.env.AGENT_COORDINATOR_TEST_GIT_LOG;",
-      'if (destination) appendFileSync(destination, `${command} ${workspace ?? ""}`.trimEnd() + "\\n");',
-      'if (["attach", "check"].includes(command) && !existsSync(path.join(workspace, "coordinator.yaml"))) process.exit(17);',
-      "if (process.env.AGENT_COORDINATOR_TEST_FAIL_GIT_COMMAND === command) process.exit(19);",
-    ].join("\n"),
-  );
-  return { engine, log };
+function isolatedRuntimeEnvironment(root: string): Record<string, string> {
+  const bin = path.join(root, "bin");
+  mkdirSync(bin);
+  return {
+    AGENT_COORDINATOR_HOME: path.join(root, "agent-coordinator-home"),
+    AGENT_COORDINATOR_GIT_BIN_DIR: bin,
+    PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+  };
 }
 
 test("init rejects an existing ordinary directory before writing workspace files", () => {
@@ -186,15 +178,9 @@ test("--no-hooks validates topology without resolving or invoking a runtime", ()
   initializeGitRoot(root);
   addSubmodule(root, child.remote);
 
-  const result = withEnvironment(
-    {
-      AGENT_COORDINATOR_GIT_COORDINATOR: path.join(temporary, "missing-engine"),
-    },
-    () =>
-      initializeWorkspace(root, manifest(child.remote), "0.1.0", {
-        installHooks: false,
-      }),
-  );
+  const result = initializeWorkspace(root, manifest(child.remote), "0.1.0", {
+    installHooks: false,
+  });
 
   assert.equal(result.gitIntegration.mode, "configuration-only");
   assert.equal(result.gitIntegration.configurationValidated, true);
@@ -202,7 +188,7 @@ test("--no-hooks validates topology without resolving or invoking a runtime", ()
   assert.equal(result.gitIntegration.attached, false);
   assert.equal(result.gitIntegration.invariantChecked, false);
   assert.deepEqual(result.gitIntegration.validatedSubmodules, ["backend"]);
-  assert.match(result.gitIntegration.detail, /runtime bootstrap.*skipped/);
+  assert.match(result.gitIntegration.detail, /runtime installation.*skipped/);
 });
 
 test("--no-hooks with --no-submodules reports configuration-only validation", () => {
@@ -210,16 +196,10 @@ test("--no-hooks with --no-submodules reports configuration-only validation", ()
   const child = createChildRemote(temporary, "api-remote");
   const root = path.join(temporary, "workspace");
 
-  const result = withEnvironment(
-    {
-      AGENT_COORDINATOR_GIT_COORDINATOR: path.join(temporary, "missing-engine"),
-    },
-    () =>
-      initializeWorkspace(root, manifest(child.remote), "0.1.0", {
-        addSubmodules: false,
-        installHooks: false,
-      }),
-  );
+  const result = initializeWorkspace(root, manifest(child.remote), "0.1.0", {
+    addSubmodules: false,
+    installHooks: false,
+  });
 
   assert.equal(result.gitIntegration.mode, "configuration-only");
   assert.equal(result.gitIntegration.configurationValidated, true);
@@ -234,20 +214,20 @@ test("active init installs, attaches, and checks before returning success", () =
   const temporary = temporaryDirectory("agent-coordinator-attach-check-");
   const child = createChildRemote(temporary, "api-remote");
   const root = path.join(temporary, "workspace");
-  const fake = fakeGitCoordinator(temporary);
+  const environment = isolatedRuntimeEnvironment(temporary);
 
   const result = withEnvironment(
-    {
-      AGENT_COORDINATOR_GIT_COORDINATOR: fake.engine,
-      AGENT_COORDINATOR_TEST_FAIL_GIT_COMMAND: undefined,
-      AGENT_COORDINATOR_TEST_GIT_LOG: fake.log,
-    },
+    environment,
     () => initializeWorkspace(root, manifest(child.remote), "0.1.0"),
   );
 
   assert.equal(
-    readFileSync(fake.log, "utf8"),
-    `global-install\ninstall ${root}\nattach ${root}\ncheck ${root}\n`,
+    existsSync(path.join(environment.AGENT_COORDINATOR_GIT_BIN_DIR!, "git")),
+    true,
+  );
+  assert.equal(
+    git(root, "config", "--local", "--get", "gitCoordinator.manifest"),
+    "coordinator.yaml",
   );
   assert.equal(result.gitIntegration.mode, "active");
   assert.equal(result.gitIntegration.hooksInstalled, true);
@@ -259,28 +239,32 @@ test("init does not return success when the final invariant check fails", () => 
   const temporary = temporaryDirectory("agent-coordinator-check-failure-");
   const child = createChildRemote(temporary, "api-remote");
   const root = path.join(temporary, "workspace");
-  const fake = fakeGitCoordinator(temporary);
+  initializeGitRoot(root);
+  addSubmodule(root, child.remote);
+  writeFileSync(path.join(root, "api", "uncommitted.txt"), "dirty read-only repository\n");
+  const environment = isolatedRuntimeEnvironment(temporary);
 
   assert.throws(
     () =>
       withEnvironment(
-        {
-          AGENT_COORDINATOR_GIT_COORDINATOR: fake.engine,
-          AGENT_COORDINATOR_TEST_FAIL_GIT_COMMAND: "check",
-          AGENT_COORDINATOR_TEST_GIT_LOG: fake.log,
-        },
-        () => initializeWorkspace(root, manifest(child.remote), "0.1.0"),
+        environment,
+        () =>
+          initializeWorkspace(
+            root,
+            manifest(child.remote, {
+              mode: "fixed",
+              name: "main",
+              readOnly: true,
+            }),
+            "0.1.0",
+          ),
       ),
     (error: unknown) => {
       assert.ok(error instanceof CoordinatorError);
       assert.equal(error.code, "COMMAND_FAILED");
-      assert.match(error.message, /check/);
+      assert.match(error.message, /read-only|local changes/);
       return true;
     },
-  );
-  assert.equal(
-    readFileSync(fake.log, "utf8"),
-    `global-install\ninstall ${root}\nattach ${root}\ncheck ${root}\n`,
   );
 });
 

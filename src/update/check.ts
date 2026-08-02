@@ -154,13 +154,16 @@ export function applyUpdate(
   options: { stdio?: "pipe" | "inherit" | undefined } = {},
 ): CommandResult {
   parseReleaseTag(tag);
-  return runCommand(
+  const stdio = options.stdio ?? "inherit";
+  const result = runCommand(
     "npm",
     [
       "install",
       "--global",
       `git+https://github.com/${PROJECT_REPOSITORY}.git#${tag}`,
     ],
-    { stdio: options.stdio ?? "inherit" },
+    { stdio },
   );
+  runCommand("coordinator", ["install"], { stdio });
+  return result;
 }

@@ -1,6 +1,6 @@
 {
   "name": "agent-coordinator",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   "type": "module",
@@ -11,18 +11,22 @@
     "dist",
     "docs/assets",
     "templates",
-    "README.md"
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
     "node": ">=20.12.0"
   },
   "scripts": {
-    "compile": "tsup",
+    "compile": "tsup && npm run compile:git",
+    "compile:git": "esbuild src/git/runtime/git-wrapper.mjs --bundle --platform=neutral --format=esm --target=node20 '--external:node:*' --banner:js='/* agent-coordinator-git-wrapper-v1 */' --outfile=dist/git-wrapper.mjs && chmod +x dist/git-wrapper.mjs",
     "dev": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test test/**/*.test.ts",
-    "check:dist": "git diff --exit-code -- dist",
-    "check": "npm run typecheck && npm test && npm run compile && npm run check:dist",
+    "test": "npm run compile && npm run test:unit && npm run test:git",
+    "test:unit": "tsx --test test/**/*.test.ts",
+    "test:git": "AGENT_COORDINATOR_GIT_RUNTIME_UNDER_TEST=./dist/git-wrapper.mjs node --test test/git-runtime.test.mjs",
+    "check:dist": "test -f dist/git-wrapper.mjs && git ls-files --error-unmatch dist/git-wrapper.mjs >/dev/null && git diff --exit-code -- dist",
+    "check": "npm run typecheck && npm test && npm run check:dist",
     "demo:asset": "npm run compile && node scripts/render-terminal-demo.mjs"
   },
   "dependencies": {
@@ -34,6 +38,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.19.27",
+    "esbuild": "^0.28.1",
     "tsup": "^8.5.1",
     "tsx": "^4.20.6",
     "typescript": "^7.0.2"

@@ -168,7 +168,7 @@ change the source and run \`coordinator agents sync\`.
 
 Gitlinks are the authoritative version lock. From this root, ordinary
 \`git add\`, \`git commit\`, \`git pull\`, \`git push\`, \`git checkout\`, and
-\`git worktree\` are coordinated by Git Coordinator. Never repair an invariant
+\`git worktree\` are coordinated by Agent Coordinator. Never repair an invariant
 with reset, clean, force checkout, or discarded user changes.
 
 ## Verification

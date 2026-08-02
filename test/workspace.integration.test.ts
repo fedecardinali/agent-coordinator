@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -12,10 +11,36 @@ import path from "node:path";
 import test from "node:test";
 import { loadManifest } from "../src/core/manifest.js";
 import { coordinatorManifestSchema } from "../src/core/schema.js";
+import {
+  installMachineGitRuntime,
+  installWorkspaceGitIntegration,
+  invokeGitRuntime,
+} from "../src/git/install.js";
 import { initializeWorkspace } from "../src/workspace/initialize.js";
 import { synchronizeWorkspace } from "../src/workspace/sync.js";
 import { migrateLegacyWorkspace } from "../src/workspace/migrate.js";
 import { createChildRemote, git, temporaryDirectory } from "./helpers.js";
+
+function withEnvironment<T>(
+  values: Record<string, string | undefined>,
+  operation: () => T,
+): T {
+  const previous = new Map(
+    Object.keys(values).map((key) => [key, process.env[key]]),
+  );
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return operation();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
 
 test("init creates a Git-compatible workspace and materializes committed skills", (context) => {
   const temporary = temporaryDirectory();
@@ -76,22 +101,21 @@ test("init creates a Git-compatible workspace and materializes committed skills"
   git(root, "commit", "-m", "Initialize coordinated workspace");
   assert.match(git(root, "submodule", "status"), /^[0-9a-f]{40} backend/m);
 
-  const engine = path.resolve(import.meta.dirname, "../../git-coordinator/src/cli.mjs");
-  const engineWrapper = path.resolve(
-    import.meta.dirname,
-    "../../git-coordinator/src/git-wrapper.mjs",
+  const runtimeHome = path.join(temporary, "agent-coordinator-home");
+  const runtimeBin = path.join(temporary, "bin");
+  mkdirSync(runtimeBin);
+  withEnvironment(
+    {
+      AGENT_COORDINATOR_HOME: runtimeHome,
+      AGENT_COORDINATOR_GIT_BIN_DIR: runtimeBin,
+    },
+    () => {
+      installMachineGitRuntime({ stdio: "pipe" });
+      installWorkspaceGitIntegration(root, { stdio: "pipe" });
+      const invariant = invokeGitRuntime("check", root, { stdio: "pipe" });
+      assert.match(invariant.stdout, /invariant OK/);
+    },
   );
-  if (
-    existsSync(engine) &&
-    existsSync(engineWrapper) &&
-    readFileSync(engineWrapper, "utf8").includes("coordinator.yaml")
-  ) {
-    execFileSync(process.execPath, [engine, "install", root]);
-    const invariant = execFileSync(process.execPath, [engine, "check", root], {
-      encoding: "utf8",
-    });
-    assert.match(invariant, /invariant OK/);
-  }
 });
 
 test("legacy Git Coordinator configuration migrates without changing it", (context) => {

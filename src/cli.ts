@@ -22,10 +22,13 @@ import {
 } from "./core/schema.js";
 import { runDoctor, type DoctorResult } from "./doctor/check.js";
 import {
-  installGitRuntime,
-  invokeGitCoordinator,
+  installMachineGitRuntime,
+  installWorkspaceGitIntegration,
+  invokeGitRuntime,
+  uninstallMachineGitRuntime,
+  uninstallWorkspaceGitIntegration,
   yamlNativeGitRuntimeActive,
-} from "./git/adapter.js";
+} from "./git/install.js";
 import { inspectWorkspace, demoWorkspaceStatus } from "./status/inspect.js";
 import { renderDashboard } from "./ui/dashboard.js";
 import { runLocalCompose } from "./local/compose.js";
@@ -212,7 +215,7 @@ program
   .option("--tools <tools>", "comma-separated agent runtimes", "codex,claude")
   .option("--discover-skills", "discover committed skills after cloning", false)
   .option("--no-submodules", "write configuration without cloning repositories")
-  .option("--no-hooks", "configuration only: skip runtime bootstrap, hooks, attach, and check")
+  .option("--no-hooks", "configuration only: skip runtime installation, hooks, attach, and check")
   .option("--dry-run", "show the initialization contract without writing")
   .option("--force", "adopt conflicting generated destinations")
   .action(async (directory: string, options: {
@@ -385,35 +388,45 @@ for (const mode of ["sync", "check"] as const) {
     });
 }
 
-const git = program.command("git").description("operate the Git Coordinator compatibility runtime");
-for (const command of ["install", "attach", "check"] as const) {
+const git = program.command("git").description("operate the embedded Git runtime");
+for (const command of ["install", "uninstall", "attach", "check"] as const) {
   git.command(command)
     .description(
       command === "install"
-        ? "install the pinned runtime and this workspace's Git integration"
-        : `${command} the Git Coordinator workspace integration`,
+        ? "install the embedded runtime and this workspace's Git integration"
+        : command === "uninstall"
+          ? "remove this workspace's Git integration"
+          : `${command} the workspace Git integration`,
     )
     .action(() => {
       const root = findWorkspaceRoot() ?? process.cwd();
       const json = globals(program).json;
       const runtime =
         command === "install"
-          ? installGitRuntime(root, {}, json ? "pipe" : "inherit")
+          ? installMachineGitRuntime({ stdio: json ? "pipe" : "inherit" })
           : null;
-      const result = invokeGitCoordinator(command, root, {
-        stdio: json ? "pipe" : "inherit",
-      });
+      const result = command === "install"
+        ? installWorkspaceGitIntegration(root, {
+            stdio: json ? "pipe" : "inherit",
+          })
+        : command === "uninstall"
+          ? uninstallWorkspaceGitIntegration(root, {
+              stdio: json ? "pipe" : "inherit",
+            })
+          : invokeGitRuntime(command, root, {
+              stdio: json ? "pipe" : "inherit",
+            });
       if (json) {
         writeJson({
           command,
           root,
-          runtime: runtime
-            ? { status: runtime.status, stdout: runtime.stdout, stderr: runtime.stderr }
-            : null,
+          runtime,
           result,
         });
       }
-      if (result.status !== 0) process.exitCode = result.status;
+      if ("status" in result && result.status !== 0) {
+        process.exitCode = result.status;
+      }
     });
 }
 
@@ -435,11 +448,20 @@ program
   .description("install or refresh the transparent Git runtime on this machine")
   .action(() => {
     const json = globals(program).json;
-    const result = installGitRuntime(
-      process.cwd(),
-      {},
-      json ? "pipe" : "inherit",
-    );
+    const result = installMachineGitRuntime({
+      stdio: json ? "pipe" : "inherit",
+    });
+    if (json) writeJson(result);
+  });
+
+program
+  .command("uninstall")
+  .description("remove the managed transparent Git runtime from this machine")
+  .action(() => {
+    const json = globals(program).json;
+    const result = uninstallMachineGitRuntime({
+      stdio: json ? "pipe" : "inherit",
+    });
     if (json) writeJson(result);
   });
 

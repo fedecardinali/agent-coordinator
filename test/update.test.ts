@@ -87,6 +87,16 @@ writeFileSync(process.env.AGENT_COORDINATOR_NPM_LOG, JSON.stringify(process.argv
 `,
   );
   chmodSync(npm, 0o755);
+
+  const coordinator = path.join(directory, "coordinator");
+  writeFileSync(
+    coordinator,
+    `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.env.AGENT_COORDINATOR_INSTALL_LOG, JSON.stringify(process.argv.slice(2)));
+`,
+  );
+  chmodSync(coordinator, 0o755);
 }
 
 test("release tags use strict semantic versions and precedence", () => {
@@ -142,11 +152,13 @@ test("updates install the exact validated release tag", (context) => {
   context.after(() => rmSync(temporary, { recursive: true }));
   const binaries = path.join(temporary, "bin");
   const log = path.join(temporary, "npm.json");
+  const installLog = path.join(temporary, "coordinator.json");
   fakeExecutables(binaries);
 
   withEnvironment(
     {
       AGENT_COORDINATOR_NPM_LOG: log,
+      AGENT_COORDINATOR_INSTALL_LOG: installLog,
       PATH: `${binaries}:${process.env.PATH ?? ""}`,
     },
     () => applyUpdate("0.2.0", { stdio: "pipe" }),
@@ -157,4 +169,5 @@ test("updates install the exact validated release tag", (context) => {
     "--global",
     "git+https://github.com/fedecardinali/agent-coordinator.git#0.2.0",
   ]);
+  assert.deepEqual(JSON.parse(readFileSync(installLog, "utf8")), ["install"]);
 });

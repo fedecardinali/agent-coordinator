@@ -3,8 +3,8 @@
 ## Scope
 
 This repository owns the declarative workspace model, terminal interface,
-agent/skill adapters, CI/CD generators, and the compatibility adapter for the
-separately installed Git Coordinator runtime.
+agent/skill adapters, CI/CD generators, and the embedded transparent Git
+runtime installed by Agent Coordinator.
 
 ## Architecture
 
@@ -13,7 +13,9 @@ separately installed Git Coordinator runtime.
 - Every mutating operation must support a preview or check mode.
 - Generated files must identify Agent Coordinator as their owner.
 - Tool-specific agent files are renderings of one neutral repository role.
-- Git Coordinator remains an external compatibility boundary in the MVP.
+- The transparent Git wrapper is an internal runtime of the same package and
+  release; it must remain lightweight and delegate uncoordinated commands to
+  the real Git executable.
 
 ## Safety
 
@@ -22,7 +24,9 @@ separately installed Git Coordinator runtime.
 - Never overwrite an unmanaged file silently.
 - Never copy dirty working-tree skill files; materialize committed Git trees.
 - Never store tokens or secret values in the workspace manifest or lockfile.
-- Updating Agent Coordinator must not update or uninstall Git Coordinator.
+- Machine installation may replace only recognized Agent Coordinator or legacy
+  Git Coordinator wrappers, and workspace reinstall must preserve unrelated
+  pre-existing hooks.
 - Preserve `.git-coordinator.json` schema 1 and 2 migration compatibility.
 
 ## Verification

@@ -3,7 +3,10 @@ import path from "node:path";
 import { commandAvailable, runCommand } from "../core/command.js";
 import { errorMessage } from "../core/errors.js";
 import type { CoordinatorManifest } from "../core/schema.js";
-import { findGitCoordinator, invokeGitCoordinator } from "../git/adapter.js";
+import {
+  installedGitRuntimePath,
+  invokeGitRuntime,
+} from "../git/install.js";
 import { isOwnedGitConfiguration } from "../git/configuration.js";
 import { synchronizeWorkspace } from "../workspace/sync.js";
 
@@ -129,11 +132,11 @@ export function runDoctor(
     }),
   );
   checks.push(
-    check("Git Coordinator", () => {
-      if (!findGitCoordinator(root)) {
+    check("Git runtime", () => {
+      if (!existsSync(installedGitRuntimePath())) {
         return { detail: "runtime not installed", status: "fail" };
       }
-      const result = invokeGitCoordinator("check", root, { allowFailure: true });
+      const result = invokeGitRuntime("check", root, { allowFailure: true });
       return result.status === 0
         ? { detail: result.stdout || "invariant OK" }
         : { detail: result.stderr || result.stdout, status: "fail" };

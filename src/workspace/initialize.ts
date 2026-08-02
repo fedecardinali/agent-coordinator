@@ -16,9 +16,10 @@ import {
   type Repository,
 } from "../core/schema.js";
 import {
-  installGitRuntime,
-  invokeGitCoordinator,
-} from "../git/adapter.js";
+  installMachineGitRuntime,
+  installWorkspaceGitIntegration,
+  invokeGitRuntime,
+} from "../git/install.js";
 import { discoverSkillSources } from "../agents/skills.js";
 import { synchronizeWorkspace, type WorkspaceSyncResult } from "./sync.js";
 
@@ -474,10 +475,10 @@ export function initializeWorkspace(
     : synchronizeWorkspace(root, manifest, generatorVersion, { force });
   if (!dryRun) validateNativeConfiguration(root, manifest);
   if (!dryRun && installHooks) {
-    installGitRuntime(root, {}, gitStdio);
-    invokeGitCoordinator("install", root, { stdio: gitStdio });
-    invokeGitCoordinator("attach", root, { stdio: gitStdio });
-    invokeGitCoordinator("check", root, { stdio: gitStdio });
+    installMachineGitRuntime({ stdio: gitStdio });
+    installWorkspaceGitIntegration(root, { stdio: gitStdio });
+    invokeGitRuntime("attach", root, { stdio: gitStdio });
+    invokeGitRuntime("check", root, { stdio: gitStdio });
   }
   const gitIntegration: InitializeResult["gitIntegration"] = dryRun
     ? {
@@ -494,7 +495,7 @@ export function initializeWorkspace(
       ? {
           attached: true,
           configurationValidated: true,
-          detail: "Native coordinator.yaml Git configuration, submodule topology, branch attachment, and Git Coordinator invariant validated.",
+          detail: "Native coordinator.yaml Git configuration, submodule topology, branch attachment, and embedded Git runtime invariant validated.",
           hooksInstalled: true,
           invariantChecked: true,
           missingSubmodules: [],
@@ -505,7 +506,7 @@ export function initializeWorkspace(
           attached: false,
           configurationValidated: true,
           detail:
-            "Configuration-only mode (--no-hooks): native coordinator.yaml Git configuration and materialized submodules were validated; runtime bootstrap, hooks, attach, and the runtime invariant check were intentionally skipped.",
+            "Configuration-only mode (--no-hooks): native coordinator.yaml Git configuration and materialized submodules were validated; runtime installation, hooks, attach, and the runtime invariant check were intentionally skipped.",
           hooksInstalled: false,
           invariantChecked: false,
           missingSubmodules,

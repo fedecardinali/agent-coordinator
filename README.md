@@ -23,9 +23,9 @@
 
 Agent Coordinator turns a coordinator repository and its Git submodules into one
 intentional workspace. Describe each repository once in `coordinator.yaml`, then
-let Git Coordinator read that manifest directly while rendering the project
-agents expected by your coding tools, committed skills, and coordinated GitHub
-Actions workflows.
+let Agent Coordinator preserve ordinary Git across every selected repository
+while rendering the project agents expected by your coding tools, committed
+skills, and coordinated GitHub Actions workflows.
 
 > One manifest in. Tool-specific configuration out. Ordinary Git stays
 > ordinary.
@@ -77,11 +77,10 @@ flatten repositories or erase their independent histories.
 - [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login` for
   the interactive repository picker and private release updates
 
-The two coordinators have separate responsibilities. Agent Coordinator owns the
-workspace model and generated adapters. Git Coordinator remains the external
-runtime that safely coordinates ordinary Git commands. Agent Coordinator pins,
-verifies, and installs a compatible engine version without modifying the
-system Git binary.
+Agent Coordinator owns the complete contract, including the transparent Git
+runtime. One package, one version, and one `coordinator` executable install and
+update the workspace model, generated adapters, and ordinary-Git integration.
+The system Git binary is never modified.
 
 ### Install from the current checkout
 
@@ -107,26 +106,23 @@ installation from the private repository is also supported:
 ```sh
 gh auth setup-git
 npm install --global \
-  git+https://github.com/fedecardinali/agent-coordinator.git#v0.2.1
+  git+https://github.com/fedecardinali/agent-coordinator.git#v0.3.0
 ```
 
 ### Install the transparent Git runtime
 
-Install or refresh the compatible Git Coordinator runtime:
+Install or refresh Agent Coordinator's embedded Git runtime:
 
 ```sh
 coordinator install
 ```
 
-Agent Coordinator honors an engine explicitly selected through
-`AGENT_COORDINATOR_GIT_COORDINATOR`. Otherwise it clones the pinned Git
-Coordinator commit into an immutable cache under
-`~/.local/share/agent-coordinator/git-engines`, verifies its origin, commit,
-detached state, and clean tree, then installs the stable machine-wide runtime.
-An unrelated `git-coordinator` found on `PATH` is not trusted as the installer
-source. Automatic sibling-checkout discovery is disabled in production; the
-development adapter enables it only through an explicit API option. An
-unexpected or modified cache is left untouched and reported as an error.
+The release already contains a self-contained runtime. Installation copies it
+to a stable path under `~/.local/share/agent-coordinator` and adds one managed
+`git` shim ahead of the system Git on `PATH`. Outside a coordinator workspace,
+that shim delegates directly to the real Git executable. Installation replaces
+only a recognized Agent Coordinator shim (or its legacy predecessor); an
+unmanaged executable is left untouched and reported as an error.
 
 ### Initialize a workspace
 
@@ -146,9 +142,9 @@ The wizard:
 4. Optionally discovers committed skills from the selected repositories.
 5. Initializes the root Git repository, adds submodules, writes the manifest,
    and synchronizes generated files.
-6. Resolves or bootstraps the pinned Git runtime and installs the workspace Git
-   integration, attaches policy-resolved child branches, and verifies the Git
-   invariant, unless `--no-hooks` is selected.
+6. Installs the embedded Git runtime and workspace integration, attaches
+   policy-resolved child branches, and verifies the Git invariant, unless
+   `--no-hooks` is selected.
 
 Then inspect the workspace and commit the generated contract:
 
@@ -159,8 +155,8 @@ git commit -m "Initialize coordinated workspace"
 ```
 
 `--no-hooks` is a configuration-only mode: it writes and validates the
-   manifest and submodules without bootstrapping the
-runtime, installing hooks, attaching branches, or running the runtime check.
+manifest and submodules without installing the runtime or hooks, attaching
+branches, or running the runtime check.
 
 For automation or a non-interactive terminal, declare repositories explicitly:
 
@@ -330,9 +326,9 @@ unmanaged file unless it is explicitly adopted with `--force`.
 
 ## Transparent multi-repository Git
 
-Git Coordinator reads `coordinator.yaml` directly. Once the runtime and
-workspace integration are installed, commands from the coordinator root remain
-familiar:
+Agent Coordinator's embedded runtime reads `coordinator.yaml` directly. Once
+the machine runtime and workspace integration are installed, commands from the
+coordinator root remain familiar:
 
 ```sh
 git add .
@@ -344,9 +340,10 @@ git checkout -b feature/new-work
 git worktree add ../new-worktree
 ```
 
-Git Coordinator applies the operation to writable children according to their
-branch policies, updates root gitlinks, and delegates unrelated Git commands to
-the real Git executable. Outside a configured workspace, Git behaves normally.
+Agent Coordinator applies the operation to writable children according to
+their branch policies, updates root gitlinks, and delegates unrelated Git
+commands to the real Git executable. Outside a configured workspace, Git
+behaves normally.
 
 ### Branch policies
 
@@ -380,14 +377,16 @@ current coordinator branch. Legacy schema version 1 manifests with an external
 Useful runtime commands are deliberately explicit:
 
 ```sh
-coordinator git install   # ensure the pinned runtime, then install workspace integration
+coordinator git install   # refresh the embedded runtime and install workspace integration
 coordinator git attach    # resolve and attach child branches
 coordinator git check     # validate the Git invariant
+coordinator git uninstall # remove only this workspace's integration
 ```
 
-Cross-repository pushes cannot be atomic. Git Coordinator publishes writable
-children before the root coordinator and reports partial progress if a later
-remote rejects its push.
+`coordinator install` and `coordinator uninstall` manage only the machine
+integration. Cross-repository pushes cannot be atomic: Agent Coordinator
+publishes writable children before the root coordinator and reports partial
+progress if a later remote rejects its push.
 
 ## Local Docker Compose
 
@@ -522,7 +521,7 @@ doctor actions. In a non-interactive terminal it prints status and exits.
 - Initialized child repositories
 - Child revisions matching root gitlinks
 - Native Git manifest compatibility and up-to-date agent, skill, and CI files
-- Git Coordinator availability and invariants
+- Embedded Git runtime availability and invariants
 
 ```sh
 coordinator doctor
@@ -546,14 +545,15 @@ coordinator update --apply
 ```
 
 Updates require an authenticated GitHub CLI configured for Git credentials.
-Updating Agent Coordinator does not modify a workspace and does not update or
-uninstall Git Coordinator. Run `coordinator sync --check` afterward to see
-whether the new CLI would change generated outputs.
+Applying an update also refreshes the managed machine Git runtime from that
+same release; it does not rewrite workspace manifests or generated files. Run
+`coordinator sync --check` afterward to see whether the new CLI would change
+generated outputs.
 
 If no private release has been published yet, the command reports that no
 release is available.
 
-## Migrating an existing Git Coordinator workspace
+## Migrating an existing legacy workspace
 
 Agent Coordinator understands `.git-coordinator.json` schema 1 and 2.
 Migration is preview-first: without `--write`, the generated YAML is printed to
@@ -616,13 +616,15 @@ need `--force`.
 | `coordinator agents check` | Check agent and skill outputs without writing. |
 | `coordinator ci sync` | Generate configured delivery files. |
 | `coordinator ci check` | Check delivery files without writing. |
-| `coordinator git install` | Ensure the pinned machine runtime, then install Git Coordinator integration for the workspace. |
+| `coordinator git install` | Refresh the embedded machine runtime, then install this workspace's Git integration. |
+| `coordinator git uninstall` | Remove only this workspace's managed Git integration. |
 | `coordinator git attach` | Attach policy-resolved repository branches. |
-| `coordinator git check` | Run the Git Coordinator invariant check. |
+| `coordinator git check` | Run the coordinated Git invariant check. |
 | `coordinator compose [args...]` | Run Docker Compose from `local.compose`, forwarding all remaining arguments. |
-| `coordinator install` | Resolve or bootstrap the pinned Git Coordinator engine, then install its machine-wide runtime. |
+| `coordinator install` | Install or refresh the embedded machine-wide Git runtime. |
+| `coordinator uninstall` | Remove only the managed machine-wide Git runtime. |
 | `coordinator update [--apply]` | Check or explicitly apply the latest private release. |
-| `coordinator migrate [directory] [--write] [--adopt-git]` | Preview or write a manifest from legacy Git Coordinator configuration, optionally removing safely absorbed legacy files. |
+| `coordinator migrate [directory] [--write] [--adopt-git]` | Preview or write a manifest from legacy Git configuration, optionally removing safely absorbed legacy files. |
 | `coordinator demo` | Render deterministic sample status used by documentation assets. |
 
 Global output flags work across commands:
@@ -650,7 +652,8 @@ Agent Coordinator is conservative around user-owned state:
   their ownership lock is written atomically.
 - Secret values never belong in `coordinator.yaml` or its lockfiles; only the
   GitHub secret name is stored.
-- Git Coordinator remains a separate installation and update boundary.
+- Machine installation replaces or removes only recognized Agent Coordinator
+  shims, including the legacy managed shim during migration.
 
 ## Non-goals
 
@@ -662,8 +665,7 @@ Agent Coordinator currently does **not**:
   another platform.
 - Provision GitHub secrets or environment protection rules.
 - Make independent Git remotes behave like an atomic transaction.
-- Replace Git Coordinator's transparent runtime or reinstall the system Git
-  binary.
+- Replace or modify the system Git binary.
 - Provide a desktop or web GUI. The current interface is a scriptable CLI with
   interactive terminal prompts and a rendered status dashboard.
 - Rewrite workspaces automatically when the CLI itself is updated.
@@ -723,7 +725,7 @@ branch.
 ```text
 src/core/        manifest validation, file planning, errors, commands
 src/workspace/   initialization, synchronization, legacy migration
-src/git/         pinned Git Coordinator bootstrap and compatibility adapter
+src/git/         embedded transparent Git runtime and safe installer
 src/agents/      project-agent renderers and committed skill materialization
 src/ci/          embedded deployment runtime and GitHub Actions generation
 src/status/      workspace inspection

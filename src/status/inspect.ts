@@ -2,7 +2,7 @@ import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { runCommand } from "../core/command.js";
 import type { CoordinatorManifest, Repository } from "../core/schema.js";
-import { findGitCoordinator } from "../git/adapter.js";
+import { installedGitRuntimePath } from "../git/install.js";
 
 export type Health = "ready" | "attention" | "blocked";
 
@@ -126,7 +126,7 @@ export function inspectWorkspace(
         0,
       ),
     },
-    gitRuntime: findGitCoordinator(root) !== null,
+    gitRuntime: existsSync(installedGitRuntimePath()),
     health,
     version,
   };

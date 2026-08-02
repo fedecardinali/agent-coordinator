@@ -216,8 +216,8 @@ export async function promptWorkspaceManifest(
       `${repositories.length} repositories`,
       `${tools.length} agent runtimes`,
       discoverSkills ? "committed skills will be discovered" : "skills can be added later",
-      "Git Coordinator will preserve ordinary git commands",
-      "a compatible Git runtime may be installed machine-wide",
+      "Agent Coordinator will preserve ordinary git commands",
+      "its embedded Git runtime may be installed machine-wide",
     ].join("\n"),
     "Plan",
   );

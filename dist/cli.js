@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.ts
-import path16 from "path";
+import path15 from "path";
 import { Command, CommanderError } from "commander";
 import pc3 from "picocolors";
 
@@ -319,7 +319,7 @@ change the source and run \`coordinator agents sync\`.
 
 Gitlinks are the authoritative version lock. From this root, ordinary
 \`git add\`, \`git commit\`, \`git pull\`, \`git push\`, \`git checkout\`, and
-\`git worktree\` are coordinated by Git Coordinator. Never repair an invariant
+\`git worktree\` are coordinated by Agent Coordinator. Never repair an invariant
 with reset, clean, force checkout, or discarded user changes.
 
 ## Verification
@@ -383,24 +383,24 @@ import path2 from "path";
 import { spawnSync } from "child_process";
 function runCommand(command, argumentsList, options = {}) {
   const stdio = options.stdio ?? "pipe";
-  const result = spawnSync(command, argumentsList, {
+  const result2 = spawnSync(command, argumentsList, {
     cwd: options.cwd,
     env: { ...process.env, ...options.env },
     encoding: "utf8",
     input: options.input,
     stdio
   });
-  if (result.error) {
+  if (result2.error) {
     throw new CoordinatorError(
-      `Could not execute '${command}': ${result.error.message}`,
+      `Could not execute '${command}': ${result2.error.message}`,
       "COMMAND_NOT_FOUND"
     );
   }
-  const status = result.status ?? 1;
+  const status = result2.status ?? 1;
   const output = {
     status,
-    stdout: typeof result.stdout === "string" ? result.stdout.trim() : "",
-    stderr: typeof result.stderr === "string" ? result.stderr.trim() : ""
+    stdout: typeof result2.stdout === "string" ? result2.stdout.trim() : "",
+    stderr: typeof result2.stderr === "string" ? result2.stderr.trim() : ""
   };
   if (status !== 0 && !options.allowFailure) {
     const detail = output.stderr || output.stdout || `exit ${status}`;
@@ -481,7 +481,7 @@ function gitPath(value2) {
   return value2.split(path2.sep).join("/");
 }
 function treeEntry(repositoryDirectory, commit, relativePath2) {
-  const result = runCommand(
+  const result2 = runCommand(
     "git",
     [
       "-C",
@@ -493,26 +493,26 @@ function treeEntry(repositoryDirectory, commit, relativePath2) {
     ],
     { allowFailure: true }
   );
-  if (result.status !== 0) {
+  if (result2.status !== 0) {
     throw new CoordinatorError(
-      `Could not read pinned Git tree ${commit} in ${repositoryDirectory}: ${result.stderr || result.stdout || `exit ${result.status}`}.`,
+      `Could not read pinned Git tree ${commit} in ${repositoryDirectory}: ${result2.stderr || result2.stdout || `exit ${result2.status}`}.`,
       "SKILL_PINNED_TREE_UNAVAILABLE"
     );
   }
-  if (!result.stdout) return null;
-  const lines = result.stdout.split("\n").filter(Boolean);
+  if (!result2.stdout) return null;
+  const lines = result2.stdout.split("\n").filter(Boolean);
   if (lines.length !== 1) return null;
   const match = /^(\d{6})\s+(\w+)\s+([0-9a-f]{40,64})\t/.exec(lines[0]);
   return match ? { mode: match[1], type: match[2], oid: match[3] } : null;
 }
 function indexedGitlink(root, repository) {
-  const result = runCommand(
+  const result2 = runCommand(
     "git",
     ["-C", root, "ls-files", "--stage", "--", repository.path],
     { allowFailure: true }
   );
-  const entries = result.stdout.split("\n").filter(Boolean).map((line) => /^(\d{6}) ([0-9a-f]{40,64}) ([0-3])\t/.exec(line)).filter((entry) => entry !== null);
-  if (result.status !== 0 || entries.length !== 1 || entries[0][1] !== "160000" || entries[0][3] !== "0") {
+  const entries = result2.stdout.split("\n").filter(Boolean).map((line) => /^(\d{6}) ([0-9a-f]{40,64}) ([0-3])\t/.exec(line)).filter((entry) => entry !== null);
+  if (result2.status !== 0 || entries.length !== 1 || entries[0][1] !== "160000" || entries[0][3] !== "0") {
     throw new CoordinatorError(
       `Repository '${repository.id}' is not pinned by one stage-0 gitlink at '${repository.path}'. Add or resolve the submodule gitlink before synchronizing skills.`,
       "SKILL_GITLINK_MISSING"
@@ -1519,16 +1519,16 @@ function loadManifest(start = process.cwd()) {
       "INVALID_MANIFEST"
     );
   }
-  const result = coordinatorManifestSchema.safeParse(raw);
-  if (!result.success) {
-    const issues = result.error.issues.map((issue) => `${issue.path.join(".") || MANIFEST_NAME}: ${issue.message}`).join("\n");
+  const result2 = coordinatorManifestSchema.safeParse(raw);
+  if (!result2.success) {
+    const issues = result2.error.issues.map((issue) => `${issue.path.join(".") || MANIFEST_NAME}: ${issue.message}`).join("\n");
     throw new CoordinatorError(
       `${MANIFEST_NAME} is invalid:
 ${issues}`,
       "INVALID_MANIFEST"
     );
   }
-  return { manifest: result.data, path: manifestPath, root };
+  return { manifest: result2.data, path: manifestPath, root };
 }
 function renderManifest(manifest) {
   return `# ${GENERATED_MARKER}. This file is project-owned; generated outputs derive from it.
@@ -1865,349 +1865,652 @@ function synchronizeCi(root, manifest, options = {}) {
 }
 
 // src/doctor/check.ts
-import { existsSync as existsSync9, readFileSync as readFileSync7 } from "fs";
-import path10 from "path";
-
-// src/git/adapter.ts
-import { existsSync as existsSync8 } from "fs";
+import { existsSync as existsSync8, readFileSync as readFileSync8 } from "fs";
 import path9 from "path";
 
-// src/git/bootstrap.ts
+// src/git/install.ts
+import { randomUUID as randomUUID2 } from "crypto";
 import {
+  accessSync,
+  chmodSync,
+  constants,
+  copyFileSync,
   existsSync as existsSync7,
+  lstatSync as lstatSync3,
   mkdirSync as mkdirSync3,
+  readFileSync as readFileSync7,
+  readlinkSync,
+  readdirSync as readdirSync4,
   realpathSync as realpathSync2,
-  statSync
+  renameSync as renameSync3,
+  rmdirSync,
+  symlinkSync,
+  unlinkSync as unlinkSync2,
+  writeFileSync as writeFileSync3
 } from "fs";
 import os2 from "os";
 import path8 from "path";
-var PINNED_GIT_COORDINATOR = {
-  repository: "fedecardinali/git-coordinator",
-  cloneUrl: "https://github.com/fedecardinali/git-coordinator.git",
-  // Retained by the immutable Git Coordinator v0.5.0 tag.
-  ref: "3fa3eccc54fc7fd8a51a96fd6086ded88aca7ca1"
-};
+var MANAGED_MARKERS = [
+  "agent-coordinator-git-wrapper-v1",
+  "git-coordinator-wrapper-v1",
+  "market-intel-coordinated-git-v1"
+];
+var COORDINATED_HOOKS = ["post-checkout", "pre-commit", "pre-push"];
+var HOOK_DIRECTORY_MARKER = ".agent-coordinator-owned";
+var HOOK_DIRECTORY_MARKER_CONTENT = "Managed by Agent Coordinator.\n";
 function environmentFor(options) {
-  return options.environment ?? process.env;
+  return options?.environment ?? process.env;
 }
-function sourceFor(options) {
-  return options.source ?? PINNED_GIT_COORDINATOR;
+function homeDirectory(environment) {
+  return environment.HOME ? path8.resolve(environment.HOME) : os2.homedir();
 }
 function agentCoordinatorHome(environment = process.env) {
-  const configured = environment.AGENT_COORDINATOR_HOME?.trim();
-  if (configured) return path8.resolve(configured);
-  const home2 = environment.HOME?.trim() || os2.homedir();
-  return path8.join(home2, ".local", "share", "agent-coordinator");
+  return path8.resolve(
+    environment.AGENT_COORDINATOR_HOME ?? path8.join(homeDirectory(environment), ".local", "share", "agent-coordinator")
+  );
 }
-function assertImmutableRef(ref) {
-  if (!/^[0-9a-f]{40}$/i.test(ref)) {
+function legacyGitCoordinatorHome(environment) {
+  return path8.resolve(
+    environment.GIT_COORDINATOR_HOME ?? path8.join(homeDirectory(environment), ".local", "share", "git-coordinator")
+  );
+}
+function installedGitRuntimePath(environment = process.env) {
+  return path8.join(agentCoordinatorHome(environment), "git-runtime", "git-wrapper.mjs");
+}
+function embeddedGitRuntimeSourcePath(_environment = process.env) {
+  const candidates = [
+    path8.resolve(import.meta.dirname, "git-wrapper.mjs"),
+    path8.resolve(import.meta.dirname, "../../dist/git-wrapper.mjs")
+  ];
+  const source = candidates.find((candidate) => existsSync7(candidate));
+  if (!source) {
     throw new CoordinatorError(
-      `Git Coordinator bootstrap ref must be a full immutable commit SHA: ${ref}`,
-      "GIT_COORDINATOR_REF_INVALID"
+      "The embedded Git runtime is missing from this Agent Coordinator installation. Reinstall Agent Coordinator and retry.",
+      "EMBEDDED_GIT_RUNTIME_MISSING"
+    );
+  }
+  return source;
+}
+function realGit(environment) {
+  return environment.GIT_COORDINATOR_REAL_GIT ?? environment.COORDINATED_GIT_REAL ?? "/usr/bin/git";
+}
+function canonicalPath(value2) {
+  try {
+    return realpathSync2(value2);
+  } catch {
+    return path8.resolve(value2);
+  }
+}
+function pathPresent(value2) {
+  try {
+    lstatSync3(value2);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function pathInside(candidate, parent) {
+  const relative = path8.relative(canonicalPath(parent), canonicalPath(candidate));
+  return relative === "" || !relative.startsWith("..") && !path8.isAbsolute(relative);
+}
+function fileHasManagedMarker(candidate) {
+  try {
+    const contents = readFileSync7(candidate, "utf8");
+    return MANAGED_MARKERS.some((marker) => contents.includes(marker));
+  } catch {
+    return false;
+  }
+}
+function isManagedExecutable(candidate, environment) {
+  if (!pathPresent(candidate)) return false;
+  const metadata = lstatSync3(candidate);
+  if (metadata.isSymbolicLink()) {
+    const target = path8.resolve(path8.dirname(candidate), readlinkSync(candidate));
+    if (pathInside(target, agentCoordinatorHome(environment)) || pathInside(target, legacyGitCoordinatorHome(environment))) {
+      return true;
+    }
+    return fileHasManagedMarker(target);
+  }
+  return metadata.isFile() && fileHasManagedMarker(candidate);
+}
+function ensureManagedOrAbsent(candidate, environment) {
+  if (pathPresent(candidate) && !isManagedExecutable(candidate, environment)) {
+    throw new CoordinatorError(
+      `Refusing to replace unmanaged executable: ${candidate}`,
+      "UNMANAGED_GIT_EXECUTABLE"
     );
   }
 }
-function gitCoordinatorCheckoutPath(options = {}) {
-  const source = sourceFor(options);
-  assertImmutableRef(source.ref);
-  return path8.join(
-    agentCoordinatorHome(environmentFor(options)),
-    "git-engines",
-    "git-coordinator",
-    source.ref
+function writableBinDirectory(environment) {
+  const explicit = environment.AGENT_COORDINATOR_GIT_BIN_DIR ?? environment.GIT_COORDINATOR_BIN_DIR;
+  if (explicit) {
+    const resolved = path8.resolve(explicit);
+    try {
+      accessSync(resolved, constants.W_OK);
+    } catch {
+      throw new CoordinatorError(
+        `Git shim directory is not writable: ${resolved}`,
+        "GIT_BIN_DIRECTORY_UNAVAILABLE"
+      );
+    }
+    return resolved;
+  }
+  const entries = (environment.PATH ?? "").split(path8.delimiter).filter(Boolean).map((entry) => path8.resolve(entry));
+  const realGitDirectory = path8.dirname(canonicalPath(realGit(environment)));
+  const beforeRealGit = [];
+  for (const entry of entries) {
+    if (canonicalPath(entry) === canonicalPath(realGitDirectory)) break;
+    beforeRealGit.push(entry);
+  }
+  for (const preferred of ["/opt/homebrew/bin", "/usr/local/bin"]) {
+    if (!beforeRealGit.some((entry) => canonicalPath(entry) === canonicalPath(preferred))) {
+      continue;
+    }
+    try {
+      accessSync(preferred, constants.W_OK);
+      return preferred;
+    } catch {
+    }
+  }
+  for (const entry of beforeRealGit) {
+    if (entry.includes("/node_modules/") || entry.includes("/.codex/") || entry.includes("/var/run/")) {
+      continue;
+    }
+    try {
+      accessSync(entry, constants.W_OK);
+      return entry;
+    } catch {
+    }
+  }
+  throw new CoordinatorError(
+    "No persistent writable PATH directory exists before the real Git binary.",
+    "GIT_BIN_DIRECTORY_UNAVAILABLE"
   );
 }
-function commandAvailable2(command, environment) {
-  return runCommand(
-    "/bin/sh",
-    ["-c", 'command -v -- "$1" >/dev/null 2>&1', "sh", command],
-    { allowFailure: true, env: environment }
-  ).status === 0;
+function result(message, options) {
+  if ((options.stdio ?? "pipe") === "inherit") process.stdout.write(`${message}
+`);
+  return { status: 0, stdout: message, stderr: "" };
 }
-function git(argumentsList, environment, allowFailure = false) {
-  return runCommand("git", argumentsList, {
-    allowFailure,
+function failedResultOrThrow(error, options) {
+  if (options.allowFailure) {
+    return { status: 1, stdout: "", stderr: errorMessage(error) };
+  }
+  throw error;
+}
+function atomicCopyExecutable(source, destination) {
+  mkdirSync3(path8.dirname(destination), { recursive: true });
+  const temporary = path8.join(
+    path8.dirname(destination),
+    `.${path8.basename(destination)}.agent-coordinator-${randomUUID2()}`
+  );
+  try {
+    copyFileSync(source, temporary);
+    chmodSync(temporary, 493);
+    renameSync3(temporary, destination);
+  } finally {
+    if (pathPresent(temporary)) unlinkSync2(temporary);
+  }
+}
+function atomicSymlink(source, destination) {
+  const temporary = path8.join(
+    path8.dirname(destination),
+    `.${path8.basename(destination)}.agent-coordinator-${randomUUID2()}`
+  );
+  try {
+    symlinkSync(source, temporary);
+    if (pathPresent(destination)) unlinkSync2(destination);
+    renameSync3(temporary, destination);
+  } finally {
+    if (pathPresent(temporary)) unlinkSync2(temporary);
+  }
+}
+function installMachineGitRuntime(options = {}) {
+  try {
+    const environment = environmentFor(options);
+    const source = embeddedGitRuntimeSourcePath(environment);
+    if (!fileHasManagedMarker(source)) {
+      throw new CoordinatorError(
+        `Embedded Git runtime has no recognized ownership marker: ${source}`,
+        "INVALID_EMBEDDED_GIT_RUNTIME"
+      );
+    }
+    const destination = installedGitRuntimePath(environment);
+    if (pathPresent(destination) && !fileHasManagedMarker(destination)) {
+      throw new CoordinatorError(
+        `Refusing to replace unmanaged runtime: ${destination}`,
+        "UNMANAGED_GIT_RUNTIME"
+      );
+    }
+    const binDirectory = writableBinDirectory(environment);
+    const gitExecutable = path8.join(binDirectory, "git");
+    const legacyCliExecutable = path8.join(binDirectory, "git-coordinator");
+    ensureManagedOrAbsent(gitExecutable, environment);
+    atomicCopyExecutable(source, destination);
+    atomicSymlink(destination, gitExecutable);
+    if (pathPresent(legacyCliExecutable) && isManagedExecutable(legacyCliExecutable, environment)) {
+      unlinkSync2(legacyCliExecutable);
+    }
+    return result(
+      `Agent Coordinator Git runtime installed in ${binDirectory}.`,
+      options
+    );
+  } catch (error) {
+    return failedResultOrThrow(error, options);
+  }
+}
+function candidateBinDirectories(environment) {
+  const explicit = environment.AGENT_COORDINATOR_GIT_BIN_DIR ?? environment.GIT_COORDINATOR_BIN_DIR;
+  const entries = explicit ? [path8.resolve(explicit)] : (environment.PATH ?? "").split(path8.delimiter).filter(Boolean).map((entry) => path8.resolve(entry));
+  return [...new Set(entries)];
+}
+function uninstallMachineGitRuntime(options = {}) {
+  try {
+    const environment = environmentFor(options);
+    const removed = [];
+    const runtime = installedGitRuntimePath(environment);
+    if (pathPresent(runtime) && !fileHasManagedMarker(runtime)) {
+      throw new CoordinatorError(
+        `Refusing to remove unmanaged runtime: ${runtime}`,
+        "UNMANAGED_GIT_RUNTIME"
+      );
+    }
+    for (const directory of candidateBinDirectories(environment)) {
+      for (const executable of ["git", "git-coordinator"]) {
+        const candidate = path8.join(directory, executable);
+        if (pathPresent(candidate) && isManagedExecutable(candidate, environment)) {
+          unlinkSync2(candidate);
+          removed.push(candidate);
+        }
+      }
+    }
+    if (pathPresent(runtime)) {
+      unlinkSync2(runtime);
+      removed.push(runtime);
+    }
+    const runtimeDirectory = path8.dirname(runtime);
+    try {
+      rmdirSync(runtimeDirectory);
+    } catch {
+    }
+    return result(
+      removed.length ? `Removed ${removed.length} managed Git runtime path${removed.length === 1 ? "" : "s"}.` : "No managed Git runtime was installed.",
+      options
+    );
+  } catch (error) {
+    return failedResultOrThrow(error, options);
+  }
+}
+function git(environment, argumentsList, options = {}) {
+  return runCommand(realGit(environment), argumentsList, {
+    allowFailure: options.allowFailure,
+    cwd: options.cwd,
+    env: {
+      ...environment,
+      GIT_COORDINATOR_INTERNAL: "1",
+      COORDINATED_GIT_INTERNAL: "1"
+    }
+  });
+}
+function workspaceRoot(directory, environment) {
+  return canonicalPath(
+    git(environment, ["-C", directory, "rev-parse", "--show-toplevel"]).stdout
+  );
+}
+function configurationExists(root) {
+  if (existsSync7(path8.join(root, "coordinator.yaml")) || existsSync7(path8.join(root, ".git-coordinator.json"))) {
+    return true;
+  }
+  const packagePath = path8.join(root, "package.json");
+  if (!existsSync7(packagePath)) return false;
+  try {
+    return Boolean(
+      JSON.parse(readFileSync7(packagePath, "utf8")).coordinatedGit
+    );
+  } catch {
+    return false;
+  }
+}
+function manifestName(root) {
+  if (existsSync7(path8.join(root, "coordinator.yaml"))) return "coordinator.yaml";
+  if (existsSync7(path8.join(root, ".git-coordinator.json"))) {
+    return ".git-coordinator.json";
+  }
+  return "package.json";
+}
+function primaryWorktree(root, environment) {
+  const line = git(environment, ["-C", root, "worktree", "list", "--porcelain"]).stdout.split("\n").find((candidate) => candidate.startsWith("worktree "));
+  if (!line) {
+    throw new CoordinatorError(
+      `Could not determine the primary worktree for ${root}.`,
+      "GIT_WORKTREE_UNAVAILABLE"
+    );
+  }
+  return canonicalPath(line.slice("worktree ".length));
+}
+function commonGitDirectory(root, environment) {
+  const common = git(environment, [
+    "-C",
+    root,
+    "rev-parse",
+    "--git-common-dir"
+  ]).stdout;
+  return canonicalPath(path8.resolve(root, common));
+}
+function resolveHookPath(root, hookPath, environment) {
+  if (!hookPath) return null;
+  return path8.isAbsolute(hookPath) ? canonicalPath(hookPath) : path8.resolve(primaryWorktree(root, environment), hookPath);
+}
+function localConfig(root, key, environment) {
+  const found = git(
+    environment,
+    ["-C", root, "config", "--local", "--get", key],
+    { allowFailure: true }
+  );
+  return found.status === 0 ? found.stdout : null;
+}
+function setLocalConfig(root, key, value2, environment) {
+  git(environment, ["-C", root, "config", "--local", "--replace-all", key, value2]);
+}
+function unsetLocalConfig(root, key, environment) {
+  git(
+    environment,
+    ["-C", root, "config", "--local", "--unset-all", key],
+    { allowFailure: true }
+  );
+}
+function hookConfigurationName(hook) {
+  return `git-coordinator-${hook}`;
+}
+function removeConfiguredHooks(root, environment) {
+  for (const hook of COORDINATED_HOOKS) {
+    const name = hookConfigurationName(hook);
+    unsetLocalConfig(root, `hook.${name}.command`, environment);
+    unsetLocalConfig(root, `hook.${name}.event`, environment);
+  }
+}
+function supportsConfiguredHooks(root, environment) {
+  const probe = git(
+    environment,
+    [
+      "-C",
+      root,
+      "hook",
+      "list",
+      "--allow-unknown-hook-name",
+      "agent-coordinator-capability-probe"
+    ],
+    { allowFailure: true }
+  );
+  const output = `${probe.stdout}
+${probe.stderr}`;
+  if (/not a git command|unknown subcommand|unknown option|usage:/i.test(output)) {
+    return false;
+  }
+  return probe.status === 0 || /no hooks found/i.test(output);
+}
+function shellDoubleQuote(value2) {
+  return value2.replace(/["\\$`]/g, "\\$&");
+}
+function installConfiguredHooks(root, runtime, environment) {
+  removeConfiguredHooks(root, environment);
+  for (const hook of COORDINATED_HOOKS) {
+    const name = hookConfigurationName(hook);
+    const command = `"${shellDoubleQuote(process.execPath)}" "${shellDoubleQuote(runtime)}" --hook ${hook}`;
+    setLocalConfig(root, `hook.${name}.command`, command, environment);
+    setLocalConfig(root, `hook.${name}.event`, hook, environment);
+  }
+}
+function writeFileHook(hooksDirectory, runtime, hook) {
+  const content = [
+    "#!/bin/sh",
+    "set -eu",
+    `"${shellDoubleQuote(process.execPath)}" "${shellDoubleQuote(runtime)}" --hook ${hook} "$@"`,
+    ""
+  ].join("\n");
+  writeFileSync3(path8.join(hooksDirectory, hook), content, { mode: 493 });
+}
+function hookPathIsManaged(root, hooksDirectory, configuredPath) {
+  if (!configuredPath) return false;
+  const resolved = path8.isAbsolute(configuredPath) ? configuredPath : path8.resolve(root, configuredPath);
+  return canonicalPath(resolved) === canonicalPath(hooksDirectory);
+}
+function managedHookFile(candidate) {
+  try {
+    const contents = readFileSync7(candidate, "utf8");
+    return contents.includes("git-wrapper.mjs") && contents.includes("--hook");
+  } catch {
+    return false;
+  }
+}
+function hooksDirectoryOwned(root, hooksDirectory, currentHookPath, environment) {
+  const marker = path8.join(hooksDirectory, HOOK_DIRECTORY_MARKER);
+  if (existsSync7(marker) && readFileSync7(marker, "utf8") === HOOK_DIRECTORY_MARKER_CONTENT) {
+    return true;
+  }
+  if (!hookPathIsManaged(root, hooksDirectory, currentHookPath)) return false;
+  const mode = localConfig(root, "gitCoordinator.hookMode", environment);
+  const manifest = localConfig(root, "gitCoordinator.manifest", environment);
+  return mode === "configured" || mode === "files" || manifest !== null;
+}
+function prepareHooksDirectory(root, hooksDirectory, currentHookPath, environment) {
+  if (!existsSync7(hooksDirectory)) {
+    mkdirSync3(hooksDirectory, { recursive: true });
+    return;
+  }
+  const owned2 = hooksDirectoryOwned(
+    root,
+    hooksDirectory,
+    currentHookPath,
+    environment
+  );
+  const removable = [];
+  for (const entry of readdirSync4(hooksDirectory)) {
+    const candidate = path8.join(hooksDirectory, entry);
+    if (entry === HOOK_DIRECTORY_MARKER) {
+      if (readFileSync7(candidate, "utf8") !== HOOK_DIRECTORY_MARKER_CONTENT) {
+        throw new CoordinatorError(
+          `Refusing to replace unmanaged ownership marker: ${candidate}`,
+          "UNMANAGED_GIT_HOOKS_DIRECTORY"
+        );
+      }
+      continue;
+    }
+    if (COORDINATED_HOOKS.includes(entry)) {
+      if (!managedHookFile(candidate)) {
+        throw new CoordinatorError(
+          `Refusing to replace unmanaged hook: ${candidate}`,
+          "UNMANAGED_GIT_HOOK"
+        );
+      }
+      removable.push(candidate);
+      continue;
+    }
+    if (!owned2) {
+      throw new CoordinatorError(
+        `Refusing to adopt non-empty unmanaged hooks directory: ${hooksDirectory}`,
+        "UNMANAGED_GIT_HOOKS_DIRECTORY"
+      );
+    }
+  }
+  for (const candidate of removable) unlinkSync2(candidate);
+}
+function markHooksDirectory(hooksDirectory) {
+  writeFileSync3(
+    path8.join(hooksDirectory, HOOK_DIRECTORY_MARKER),
+    HOOK_DIRECTORY_MARKER_CONTENT
+  );
+}
+function cleanManagedHooksDirectory(root, hooksDirectory, currentHookPath, environment) {
+  if (!existsSync7(hooksDirectory)) return;
+  if (!hooksDirectoryOwned(root, hooksDirectory, currentHookPath, environment)) {
+    return;
+  }
+  for (const hook of COORDINATED_HOOKS) {
+    const candidate = path8.join(hooksDirectory, hook);
+    if (existsSync7(candidate) && managedHookFile(candidate)) unlinkSync2(candidate);
+  }
+  const marker = path8.join(hooksDirectory, HOOK_DIRECTORY_MARKER);
+  if (existsSync7(marker) && readFileSync7(marker, "utf8") === HOOK_DIRECTORY_MARKER_CONTENT) {
+    unlinkSync2(marker);
+  }
+  try {
+    rmdirSync(hooksDirectory);
+  } catch {
+  }
+}
+function installWorkspaceGitIntegration(directory = process.cwd(), options = {}) {
+  try {
+    const environment = environmentFor(options);
+    const runtime = installedGitRuntimePath(environment);
+    if (!existsSync7(runtime) || !fileHasManagedMarker(runtime)) {
+      throw new CoordinatorError(
+        "Agent Coordinator's Git runtime is not installed. Run 'coordinator install' and retry.",
+        "GIT_RUNTIME_MISSING"
+      );
+    }
+    const root = workspaceRoot(directory, environment);
+    if (!configurationExists(root)) {
+      throw new CoordinatorError(
+        `${root} has no coordinator.yaml or supported legacy Git configuration.`,
+        "GIT_CONFIGURATION_MISSING"
+      );
+    }
+    const hooksDirectory = path8.join(
+      commonGitDirectory(root, environment),
+      "git-coordinator-hooks"
+    );
+    const currentHookPath = localConfig(root, "core.hooksPath", environment);
+    const alreadyInstalled = hookPathIsManaged(
+      root,
+      hooksDirectory,
+      currentHookPath
+    );
+    prepareHooksDirectory(root, hooksDirectory, currentHookPath, environment);
+    let previousHooksPath;
+    if (alreadyInstalled) {
+      previousHooksPath = localConfig(
+        root,
+        "gitCoordinator.previousHooksPath",
+        environment
+      );
+    } else {
+      previousHooksPath = resolveHookPath(root, currentHookPath, environment);
+      if (previousHooksPath) {
+        setLocalConfig(
+          root,
+          "gitCoordinator.previousHooksPath",
+          previousHooksPath,
+          environment
+        );
+      } else {
+        unsetLocalConfig(root, "gitCoordinator.previousHooksPath", environment);
+      }
+    }
+    const configuredHooks = supportsConfiguredHooks(root, environment);
+    if (configuredHooks) {
+      installConfiguredHooks(root, runtime, environment);
+    } else {
+      removeConfiguredHooks(root, environment);
+      for (const hook of COORDINATED_HOOKS) {
+        writeFileHook(hooksDirectory, runtime, hook);
+      }
+    }
+    setLocalConfig(root, "core.hooksPath", hooksDirectory, environment);
+    setLocalConfig(
+      root,
+      "gitCoordinator.hookMode",
+      configuredHooks ? "configured" : "files",
+      environment
+    );
+    setLocalConfig(root, "gitCoordinator.manifest", manifestName(root), environment);
+    markHooksDirectory(hooksDirectory);
+    return result(
+      previousHooksPath ? `Agent Coordinator Git integration installed; previous hooks remain preserved at ${previousHooksPath}.` : "Agent Coordinator Git integration installed.",
+      options
+    );
+  } catch (error) {
+    return failedResultOrThrow(error, options);
+  }
+}
+function uninstallWorkspaceGitIntegration(directory = process.cwd(), options = {}) {
+  try {
+    const environment = environmentFor(options);
+    const root = workspaceRoot(directory, environment);
+    const hooksDirectory = path8.join(
+      commonGitDirectory(root, environment),
+      "git-coordinator-hooks"
+    );
+    const previousHooksPath = localConfig(
+      root,
+      "gitCoordinator.previousHooksPath",
+      environment
+    );
+    const currentHookPath = localConfig(root, "core.hooksPath", environment);
+    const managedHookPathActive = hookPathIsManaged(
+      root,
+      hooksDirectory,
+      currentHookPath
+    );
+    removeConfiguredHooks(root, environment);
+    cleanManagedHooksDirectory(
+      root,
+      hooksDirectory,
+      currentHookPath,
+      environment
+    );
+    if (managedHookPathActive) {
+      if (previousHooksPath) {
+        setLocalConfig(root, "core.hooksPath", previousHooksPath, environment);
+      } else {
+        unsetLocalConfig(root, "core.hooksPath", environment);
+      }
+    }
+    unsetLocalConfig(root, "gitCoordinator.previousHooksPath", environment);
+    unsetLocalConfig(root, "gitCoordinator.hookMode", environment);
+    unsetLocalConfig(root, "gitCoordinator.manifest", environment);
+    return result("Agent Coordinator workspace Git integration removed.", options);
+  } catch (error) {
+    return failedResultOrThrow(error, options);
+  }
+}
+function invokeGitRuntime(mode, directory = process.cwd(), options = {}) {
+  const environment = environmentFor(options);
+  const runtime = installedGitRuntimePath(environment);
+  if (!existsSync7(runtime) || !fileHasManagedMarker(runtime)) {
+    const error = new CoordinatorError(
+      "Agent Coordinator's Git runtime is not installed. Run 'coordinator install' and retry.",
+      "GIT_RUNTIME_MISSING"
+    );
+    return failedResultOrThrow(error, options);
+  }
+  const execution2 = runCommand(process.execPath, [runtime, `--${mode}`], {
+    allowFailure: true,
+    cwd: path8.resolve(directory),
     env: environment
   });
-}
-function normalizedGithubRepository(value2) {
-  const trimmed = value2.trim().replace(/\/+$/, "");
-  const match = trimmed.match(/^https?:\/\/github\.com\/([^/]+\/[^/]+)$/i) ?? trimmed.match(/^git@github\.com:([^/]+\/[^/]+)$/i) ?? trimmed.match(/^ssh:\/\/git@github\.com\/([^/]+\/[^/]+)$/i);
-  return match?.[1]?.replace(/\.git$/i, "").toLowerCase() ?? null;
-}
-function sameRemote(actual, source) {
-  const actualGithub = normalizedGithubRepository(actual);
-  const expectedGithub = normalizedGithubRepository(source.cloneUrl);
-  if (actualGithub && expectedGithub) return actualGithub === expectedGithub;
-  if (path8.isAbsolute(actual) && path8.isAbsolute(source.cloneUrl)) {
-    try {
-      return realpathSync2(actual) === realpathSync2(source.cloneUrl);
-    } catch {
-      return path8.resolve(actual) === path8.resolve(source.cloneUrl);
-    }
+  if ((options.stdio ?? "pipe") === "inherit") {
+    if (execution2.stdout) process.stdout.write(`${execution2.stdout}
+`);
+    if (execution2.stderr) process.stderr.write(`${execution2.stderr}
+`);
   }
-  return actual.replace(/\/+$/, "") === source.cloneUrl.replace(/\/+$/, "");
-}
-function cacheInvalid(checkout, detail) {
-  return new CoordinatorError(
-    `Managed Git Coordinator cache is not the immutable expected checkout at ${checkout}: ${detail}. The cache was left untouched; choose a new AGENT_COORDINATOR_HOME or inspect it manually.`,
-    "GIT_COORDINATOR_CACHE_INVALID"
-  );
-}
-function verifyBootstrappedGitCoordinator(options = {}) {
-  const environment = environmentFor(options);
-  const source = sourceFor(options);
-  const checkout = gitCoordinatorCheckoutPath(options);
-  if (!existsSync7(checkout)) return null;
-  if (!commandAvailable2("git", environment)) {
+  if (execution2.status !== 0 && !options.allowFailure) {
     throw new CoordinatorError(
-      "Git is required to verify the managed Git Coordinator engine. Install the Xcode Command Line Tools with 'xcode-select --install' and retry.",
-      "GIT_MISSING"
+      `Git runtime ${mode} failed: ${execution2.stderr || execution2.stdout || `exit ${execution2.status}`}`,
+      "COMMAND_FAILED"
     );
   }
-  const version = git(["--version"], environment, true);
-  if (version.status !== 0) {
-    throw new CoordinatorError(
-      `Git is present but could not run: ${version.stderr || version.stdout || `exit ${version.status}`}. Install or repair the Xcode Command Line Tools and retry.`,
-      "GIT_UNAVAILABLE"
-    );
-  }
-  const cli = path8.join(checkout, "src", "cli.mjs");
-  try {
-    if (!statSync(cli).isFile()) throw cacheInvalid(checkout, "src/cli.mjs is not a file");
-  } catch (error) {
-    if (error instanceof CoordinatorError) throw error;
-    throw cacheInvalid(checkout, "src/cli.mjs is missing");
-  }
-  const head = git(["-C", checkout, "rev-parse", "HEAD"], environment, true);
-  if (head.status !== 0 || head.stdout !== source.ref) {
-    throw cacheInvalid(
-      checkout,
-      `HEAD is ${head.stdout || "unreadable"}, expected ${source.ref}`
-    );
-  }
-  const branch = git(
-    ["-C", checkout, "symbolic-ref", "--quiet", "HEAD"],
-    environment,
-    true
-  );
-  if (branch.status === 0) {
-    throw cacheInvalid(checkout, `HEAD is attached to ${branch.stdout}`);
-  }
-  const status = git(
-    ["-C", checkout, "status", "--porcelain", "--untracked-files=all"],
-    environment,
-    true
-  );
-  if (status.status !== 0 || status.stdout) {
-    throw cacheInvalid(
-      checkout,
-      status.stdout ? "the checkout has local changes" : "Git status failed"
-    );
-  }
-  const remote = git(
-    ["-C", checkout, "remote", "get-url", "origin"],
-    environment,
-    true
-  );
-  if (remote.status !== 0 || !sameRemote(remote.stdout, source)) {
-    throw cacheInvalid(
-      checkout,
-      `origin is ${remote.stdout || "missing"}, expected ${source.cloneUrl}`
-    );
-  }
-  return { checkout, cli, ref: source.ref };
+  return execution2;
 }
-function cloneFailure(checkout, detail, usedGithubCli) {
-  const authentication = usedGithubCli ? "Confirm access with 'gh auth status --hostname github.com'." : "Authenticate Git for GitHub, or install GitHub CLI and run 'gh auth login'.";
-  return new CoordinatorError(
-    `Could not bootstrap the private Git Coordinator engine at ${checkout}: ${detail}. ${authentication} The partial cache was left untouched for inspection.`,
-    "GIT_COORDINATOR_BOOTSTRAP_FAILED"
-  );
-}
-function bootstrapGitCoordinator(options = {}) {
-  const existing = verifyBootstrappedGitCoordinator(options);
-  if (existing) return existing;
-  const environment = environmentFor(options);
-  const source = sourceFor(options);
-  if (!commandAvailable2("git", environment)) {
-    throw new CoordinatorError(
-      "Git is required to install Git Coordinator. Install the Xcode Command Line Tools with 'xcode-select --install' and retry.",
-      "GIT_MISSING"
-    );
-  }
-  const version = git(["--version"], environment, true);
-  if (version.status !== 0) {
-    throw new CoordinatorError(
-      `Git is present but could not run: ${version.stderr || version.stdout || `exit ${version.status}`}. Install or repair the Xcode Command Line Tools and retry.`,
-      "GIT_UNAVAILABLE"
-    );
-  }
-  const checkout = gitCoordinatorCheckoutPath(options);
-  const parent = path8.dirname(checkout);
-  try {
-    mkdirSync3(parent, { recursive: true });
-    mkdirSync3(checkout);
-  } catch (error) {
-    if (existsSync7(checkout)) {
-      const raced = verifyBootstrappedGitCoordinator(options);
-      if (raced) return raced;
-    }
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new CoordinatorError(
-      `Could not reserve the managed Git Coordinator cache at ${checkout}: ${detail}. No existing cache was replaced.`,
-      "GIT_COORDINATOR_CACHE_CREATE_FAILED"
-    );
-  }
-  const ghAvailable = commandAvailable2("gh", environment);
-  const ghAuthenticated = ghAvailable && runCommand(
-    "gh",
-    ["auth", "status", "--hostname", "github.com"],
-    { allowFailure: true, env: environment }
-  ).status === 0;
-  const clone = ghAuthenticated ? runCommand(
-    "gh",
-    [
-      "repo",
-      "clone",
-      source.repository,
-      checkout,
-      "--",
-      "--filter=blob:none",
-      "--no-checkout"
-    ],
-    { allowFailure: true, env: environment }
-  ) : git(
-    [
-      "clone",
-      "--filter=blob:none",
-      "--no-checkout",
-      source.cloneUrl,
-      checkout
-    ],
-    environment,
-    true
-  );
-  if (clone.status !== 0) {
-    throw cloneFailure(
-      checkout,
-      clone.stderr || clone.stdout || `exit ${clone.status}`,
-      ghAuthenticated
-    );
-  }
-  const checkoutResult = git(
-    ["-C", checkout, "checkout", "--detach", source.ref],
-    environment,
-    true
-  );
-  if (checkoutResult.status !== 0) {
-    throw cloneFailure(
-      checkout,
-      `the pinned ref ${source.ref} could not be checked out: ${checkoutResult.stderr || checkoutResult.stdout || `exit ${checkoutResult.status}`}`,
-      ghAuthenticated
-    );
-  }
-  const verified = verifyBootstrappedGitCoordinator(options);
-  if (!verified) {
-    throw cacheInvalid(checkout, "the checkout disappeared after cloning");
-  }
-  return verified;
-}
-
-// src/git/adapter.ts
 function yamlNativeGitRuntimeActive(root) {
-  const result = runCommand(
-    "git",
+  const environment = process.env;
+  const configured = git(
+    environment,
     ["-C", root, "config", "--local", "--get", "gitCoordinator.manifest"],
-    {
-      allowFailure: true,
-      env: { GIT_COORDINATOR_INTERNAL: "1" }
-    }
+    { allowFailure: true }
   );
-  return result.status === 0 && result.stdout === "coordinator.yaml";
-}
-function sourceLocation(source) {
-  return {
-    kind: "source",
-    command: process.execPath,
-    arguments: [source],
-    path: source
-  };
-}
-function commandAvailable3(command, environment) {
-  return runCommand(
-    "/bin/sh",
-    ["-c", 'command -v -- "$1" >/dev/null 2>&1', "sh", command],
-    { allowFailure: true, env: environment }
-  ).status === 0;
-}
-function explicitLocation(environment) {
-  const explicit = environment.AGENT_COORDINATOR_GIT_COORDINATOR;
-  if (!explicit) return null;
-  if (!existsSync8(explicit)) {
-    throw new CoordinatorError(
-      `AGENT_COORDINATOR_GIT_COORDINATOR does not exist: ${explicit}`
-    );
-  }
-  return explicit.endsWith(".mjs") || explicit.endsWith(".js") ? sourceLocation(explicit) : { kind: "command", command: explicit, arguments: [] };
-}
-function localSourceLocation(workspace, bootstrapOptions) {
-  if (bootstrapOptions.includeLocalCheckouts !== true) return null;
-  const candidates = [
-    path9.resolve(workspace, "../git-coordinator/src/cli.mjs"),
-    path9.resolve(import.meta.dirname, "../../../git-coordinator/src/cli.mjs")
-  ];
-  const source = candidates.find((candidate) => existsSync8(candidate));
-  return source ? sourceLocation(source) : null;
-}
-function managedSourceLocation(bootstrapOptions) {
-  const managed = verifyBootstrappedGitCoordinator(bootstrapOptions);
-  return managed ? sourceLocation(managed.cli) : null;
-}
-function findGitCoordinator(workspace = process.cwd(), bootstrapOptions = {}) {
-  const environment = bootstrapOptions.environment ?? process.env;
-  const explicit = explicitLocation(environment);
-  if (explicit) return explicit;
-  const local = localSourceLocation(workspace, bootstrapOptions);
-  if (local) return local;
-  const managed = managedSourceLocation(bootstrapOptions);
-  if (managed) return managed;
-  if (commandAvailable3("git-coordinator", environment)) {
-    return { kind: "command", command: "git-coordinator", arguments: [] };
-  }
-  return null;
-}
-function runGitCoordinator(location, subcommand, workspace, options = {}) {
-  const argumentsList = [...location.arguments, subcommand];
-  if (subcommand !== "global-install") argumentsList.push(workspace);
-  return runCommand(location.command, argumentsList, {
-    cwd: workspace,
-    allowFailure: options.allowFailure,
-    stdio: options.stdio,
-    env: options.environment
-  });
-}
-function invokeGitCoordinator(subcommand, workspace, options = {}) {
-  const location = findGitCoordinator(workspace, options.bootstrap);
-  if (!location) {
-    throw new CoordinatorError(
-      "Git Coordinator is not installed. Run 'coordinator install' to install the pinned compatibility runtime, then retry.",
-      "GIT_COORDINATOR_MISSING"
-    );
-  }
-  return runGitCoordinator(location, subcommand, workspace, {
-    allowFailure: options.allowFailure,
-    stdio: options.stdio,
-    environment: options.bootstrap?.environment
-  });
-}
-function installGitRuntime(workspace = process.cwd(), bootstrapOptions = {}, stdio = "inherit") {
-  const environment = bootstrapOptions.environment ?? process.env;
-  const location = explicitLocation(environment) ?? localSourceLocation(workspace, bootstrapOptions) ?? managedSourceLocation(bootstrapOptions) ?? sourceLocation(bootstrapGitCoordinator(bootstrapOptions).cli);
-  return runGitCoordinator(location, "global-install", workspace, {
-    stdio,
-    environment: bootstrapOptions.environment
-  });
+  return configured.status === 0 && configured.stdout === "coordinator.yaml";
 }
 
 // src/git/configuration.ts
@@ -2257,8 +2560,8 @@ function synchronizeWorkspace(root, manifest, generatorVersion, options = {}) {
 // src/doctor/check.ts
 function check(label, operation) {
   try {
-    const result = operation();
-    return { label, detail: result.detail, status: result.status ?? "pass" };
+    const result2 = operation();
+    return { label, detail: result2.detail, status: result2.status ?? "pass" };
   } catch (error) {
     return { label, detail: errorMessage(error), status: "fail" };
   }
@@ -2293,7 +2596,7 @@ function runDoctor(root, manifest, version) {
   checks.push(
     check("Repositories", () => {
       const missing = manifest.repositories.filter(
-        (repository) => !existsSync9(path10.join(root, repository.path, ".git"))
+        (repository) => !existsSync8(path9.join(root, repository.path, ".git"))
       );
       return missing.length ? {
         detail: `missing: ${missing.map((repository) => repository.id).join(", ")}`,
@@ -2303,19 +2606,19 @@ function runDoctor(root, manifest, version) {
   );
   checks.push(
     check("Gitlinks", () => {
-      const result = runCommand("git", ["-C", root, "submodule", "status", "--recursive"], {
+      const result2 = runCommand("git", ["-C", root, "submodule", "status", "--recursive"], {
         allowFailure: true,
         env: { GIT_COORDINATOR_INTERNAL: "1" }
       });
-      if (result.status !== 0) return { detail: result.stderr || "unavailable", status: "warn" };
-      const drift = result.stdout.split("\n").filter((line) => /^(?:\+|-|U)/.test(line));
+      if (result2.status !== 0) return { detail: result2.stderr || "unavailable", status: "warn" };
+      const drift = result2.stdout.split("\n").filter((line) => /^(?:\+|-|U)/.test(line));
       return drift.length ? { detail: `${drift.length} submodule revisions differ from gitlinks`, status: "fail" } : { detail: "all initialized submodules match their gitlinks" };
     })
   );
   checks.push(
     check("Native Git manifest", () => {
-      const legacyPath = path10.join(root, ".git-coordinator.json");
-      if (!existsSync9(legacyPath)) {
+      const legacyPath = path9.join(root, ".git-coordinator.json");
+      if (!existsSync8(legacyPath)) {
         if (manifest.workspaceManifest) {
           return {
             detail: `coordinator.yaml still references legacy ${manifest.workspaceManifest.path}`,
@@ -2324,7 +2627,7 @@ function runDoctor(root, manifest, version) {
         }
         return { detail: "coordinator.yaml is the only Git configuration" };
       }
-      const legacy = readFileSync7(legacyPath, "utf8");
+      const legacy = readFileSync8(legacyPath, "utf8");
       return isOwnedGitConfiguration(legacy) ? {
         detail: "owned legacy adapter remains; run coordinator sync",
         status: "fail"
@@ -2336,19 +2639,19 @@ function runDoctor(root, manifest, version) {
   );
   checks.push(
     check("Generated outputs", () => {
-      const result = synchronizeWorkspace(root, manifest, version, { check: true });
-      return result.changed ? { detail: "generated files are stale; run coordinator sync", status: "fail" } : {
+      const result2 = synchronizeWorkspace(root, manifest, version, { check: true });
+      return result2.changed ? { detail: "generated files are stale; run coordinator sync", status: "fail" } : {
         detail: manifest.agents.manage === false ? "CI is synchronized; existing agent files are intentionally unmanaged" : "agents, skills, and CI are synchronized"
       };
     })
   );
   checks.push(
-    check("Git Coordinator", () => {
-      if (!findGitCoordinator(root)) {
+    check("Git runtime", () => {
+      if (!existsSync8(installedGitRuntimePath())) {
         return { detail: "runtime not installed", status: "fail" };
       }
-      const result = invokeGitCoordinator("check", root, { allowFailure: true });
-      return result.status === 0 ? { detail: result.stdout || "invariant OK" } : { detail: result.stderr || result.stdout, status: "fail" };
+      const result2 = invokeGitRuntime("check", root, { allowFailure: true });
+      return result2.status === 0 ? { detail: result2.stdout || "invariant OK" } : { detail: result2.stderr || result2.stdout, status: "fail" };
     })
   );
   return {
@@ -2358,14 +2661,14 @@ function runDoctor(root, manifest, version) {
 }
 
 // src/status/inspect.ts
-import { existsSync as existsSync10, readdirSync as readdirSync4 } from "fs";
-import path11 from "path";
+import { existsSync as existsSync9, readdirSync as readdirSync5 } from "fs";
+import path10 from "path";
 function gitText2(directory, argumentsList) {
-  const result = runCommand("git", ["-c", "core.hooksPath=/dev/null", "-C", directory, ...argumentsList], {
+  const result2 = runCommand("git", ["-c", "core.hooksPath=/dev/null", "-C", directory, ...argumentsList], {
     allowFailure: true,
     env: { GIT_COORDINATOR_INTERNAL: "1" }
   });
-  return result.status === 0 ? result.stdout : null;
+  return result2.status === 0 ? result2.stdout : null;
 }
 function policyLabel(repository) {
   if (repository.branch.mode === "fixed") return `fixed:${repository.branch.name}`;
@@ -2375,8 +2678,8 @@ function policyLabel(repository) {
 function inspectRepository(root, repository, selection) {
   const readOnly = selection?.mode === "pinned" || !selection && repository.branch.readOnly;
   const policy = selection ? `${selection.mode}:${selection.branch}` : policyLabel(repository);
-  const directory = path11.join(root, repository.path);
-  if (!existsSync10(directory)) {
+  const directory = path10.join(root, repository.path);
+  if (!existsSync9(directory)) {
     return {
       id: repository.id,
       branch: "\u2014",
@@ -2407,9 +2710,9 @@ function inspectWorkspace(root, manifest, version) {
     )
   );
   const rootBranch = gitText2(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]) ?? "unborn";
-  const skillsDirectory = path11.join(root, ".agents", "skills");
-  const skills = existsSync10(skillsDirectory) ? readdirSync4(skillsDirectory, { withFileTypes: true }).filter(
-    (entry) => entry.isDirectory() && existsSync10(path11.join(skillsDirectory, entry.name, "SKILL.md"))
+  const skillsDirectory = path10.join(root, ".agents", "skills");
+  const skills = existsSync9(skillsDirectory) ? readdirSync5(skillsDirectory, { withFileTypes: true }).filter(
+    (entry) => entry.isDirectory() && existsSync9(path10.join(skillsDirectory, entry.name, "SKILL.md"))
   ).length : 0;
   const environments = Object.values(manifest.deployments?.environments ?? {});
   const health = repositories.some((repository) => repository.health === "blocked") ? "blocked" : repositories.some((repository) => repository.health === "attention") || manifest.agents.manage === false ? "attention" : "ready";
@@ -2430,7 +2733,7 @@ function inspectWorkspace(root, manifest, version) {
         0
       )
     },
-    gitRuntime: findGitCoordinator(root) !== null,
+    gitRuntime: existsSync9(installedGitRuntimePath()),
     health,
     version
   };
@@ -2555,9 +2858,9 @@ function renderDashboard(status, options = {}) {
 }
 
 // src/local/compose.ts
-import { mkdtempSync as mkdtempSync2, rmSync as rmSync2, writeFileSync as writeFileSync3 } from "fs";
+import { mkdtempSync as mkdtempSync2, rmSync as rmSync2, writeFileSync as writeFileSync4 } from "fs";
 import os3 from "os";
-import path12 from "path";
+import path11 from "path";
 function runLocalCompose(root, manifest, argumentsList, options = {}) {
   const compose = manifest.local?.compose;
   if (!compose) {
@@ -2566,13 +2869,13 @@ function runLocalCompose(root, manifest, argumentsList, options = {}) {
       "COMPOSE_NOT_CONFIGURED"
     );
   }
-  const resolvedRoot = path12.resolve(root);
+  const resolvedRoot = path11.resolve(root);
   const temporaryDirectory = mkdtempSync2(
-    path12.join(os3.tmpdir(), "agent-coordinator-compose-")
+    path11.join(os3.tmpdir(), "agent-coordinator-compose-")
   );
-  const overridePath = path12.join(temporaryDirectory, "compose.override.yaml");
+  const overridePath = path11.join(temporaryDirectory, "compose.override.yaml");
   try {
-    writeFileSync3(
+    writeFileSync4(
       overridePath,
       compose.override.endsWith("\n") ? compose.override : `${compose.override}
 `,
@@ -2583,10 +2886,10 @@ function runLocalCompose(root, manifest, argumentsList, options = {}) {
       [
         "compose",
         "--project-directory",
-        path12.resolve(resolvedRoot, compose.projectDirectory),
+        path11.resolve(resolvedRoot, compose.projectDirectory),
         ...compose.files.flatMap((file) => [
           "-f",
-          path12.resolve(resolvedRoot, file)
+          path11.resolve(resolvedRoot, file)
         ]),
         "-f",
         overridePath,
@@ -2616,7 +2919,7 @@ import {
   select,
   text
 } from "@clack/prompts";
-import path13 from "path";
+import path12 from "path";
 import pc2 from "picocolors";
 function value(input) {
   if (isCancel(input)) {
@@ -2639,13 +2942,13 @@ function roleSuggestion(repositoryName) {
 }
 function currentGithubUser() {
   if (!commandAvailable("gh")) return void 0;
-  const result = runCommand("gh", ["api", "user", "--jq", ".login"], {
+  const result2 = runCommand("gh", ["api", "user", "--jq", ".login"], {
     allowFailure: true
   });
-  return result.status === 0 ? result.stdout : void 0;
+  return result2.status === 0 ? result2.stdout : void 0;
 }
 function listGithubRepositories(owner) {
-  const result = runCommand(
+  const result2 = runCommand(
     "gh",
     [
       "repo",
@@ -2658,12 +2961,12 @@ function listGithubRepositories(owner) {
     ],
     { allowFailure: true }
   );
-  if (result.status !== 0) {
+  if (result2.status !== 0) {
     throw new CoordinatorError(
-      result.stderr || `Could not list repositories for ${owner}.`
+      result2.stderr || `Could not list repositories for ${owner}.`
     );
   }
-  return JSON.parse(result.stdout);
+  return JSON.parse(result2.stdout);
 }
 async function branchPolicy(repository) {
   const mode = value(
@@ -2701,7 +3004,7 @@ async function branchPolicy(repository) {
 }
 async function promptWorkspaceManifest(directory) {
   intro(pc2.bgMagenta(pc2.white(" Agent Coordinator \xB7 new workspace ")));
-  const suggestedName = slug(path13.basename(path13.resolve(directory))) || "workspace";
+  const suggestedName = slug(path12.basename(path12.resolve(directory))) || "workspace";
   const name = value(
     await text({
       message: "Workspace name",
@@ -2786,14 +3089,14 @@ async function promptWorkspaceManifest(directory) {
       `${repositories.length} repositories`,
       `${tools.length} agent runtimes`,
       discoverSkills ? "committed skills will be discovered" : "skills can be added later",
-      "Git Coordinator will preserve ordinary git commands",
-      "a compatible Git runtime may be installed machine-wide"
+      "Agent Coordinator will preserve ordinary git commands",
+      "its embedded Git runtime may be installed machine-wide"
     ].join("\n"),
     "Plan"
   );
   const proceed = value(
     await confirm({
-      message: `Initialize ${name} in ${path13.resolve(directory)}?`,
+      message: `Initialize ${name} in ${path12.resolve(directory)}?`,
       initialValue: true
     })
   );
@@ -2836,7 +3139,7 @@ async function promptDashboardAction() {
 // package.json
 var package_default = {
   name: "agent-coordinator",
-  version: "0.2.1",
+  version: "0.3.0",
   private: true,
   description: "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   type: "module",
@@ -2847,18 +3150,22 @@ var package_default = {
     "dist",
     "docs/assets",
     "templates",
-    "README.md"
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   engines: {
     node: ">=20.12.0"
   },
   scripts: {
-    compile: "tsup",
+    compile: "tsup && npm run compile:git",
+    "compile:git": "esbuild src/git/runtime/git-wrapper.mjs --bundle --platform=neutral --format=esm --target=node20 '--external:node:*' --banner:js='/* agent-coordinator-git-wrapper-v1 */' --outfile=dist/git-wrapper.mjs && chmod +x dist/git-wrapper.mjs",
     dev: "tsx src/cli.ts",
     typecheck: "tsc --noEmit",
-    test: "tsx --test test/**/*.test.ts",
-    "check:dist": "git diff --exit-code -- dist",
-    check: "npm run typecheck && npm test && npm run compile && npm run check:dist",
+    test: "npm run compile && npm run test:unit && npm run test:git",
+    "test:unit": "tsx --test test/**/*.test.ts",
+    "test:git": "AGENT_COORDINATOR_GIT_RUNTIME_UNDER_TEST=./dist/git-wrapper.mjs node --test test/git-runtime.test.mjs",
+    "check:dist": "test -f dist/git-wrapper.mjs && git ls-files --error-unmatch dist/git-wrapper.mjs >/dev/null && git diff --exit-code -- dist",
+    check: "npm run typecheck && npm test && npm run check:dist",
     "demo:asset": "npm run compile && node scripts/render-terminal-demo.mjs"
   },
   dependencies: {
@@ -2870,6 +3177,7 @@ var package_default = {
   },
   devDependencies: {
     "@types/node": "^20.19.27",
+    esbuild: "^0.28.1",
     tsup: "^8.5.1",
     tsx: "^4.20.6",
     typescript: "^7.0.2"
@@ -2930,8 +3238,8 @@ function newer(candidate, current) {
   }
   return comparePrerelease(left.prerelease, right.prerelease) > 0;
 }
-function commandFailure(result) {
-  return result.stderr || result.stdout || `exit ${result.status}`;
+function commandFailure(result2) {
+  return result2.stderr || result2.stdout || `exit ${result2.status}`;
 }
 function checkForUpdate(current) {
   if (!commandAvailable("gh")) {
@@ -2959,14 +3267,14 @@ function checkForUpdate(current) {
       "UPDATE_REPOSITORY_UNAVAILABLE"
     );
   }
-  const result = runCommand(
+  const result2 = runCommand(
     "gh",
     ["api", `repos/${PROJECT_REPOSITORY}/releases/latest`],
     { allowFailure: true }
   );
-  if (result.status !== 0) {
-    if (/\bHTTP 404\b/i.test(`${result.stderr}
-${result.stdout}`)) {
+  if (result2.status !== 0) {
+    if (/\bHTTP 404\b/i.test(`${result2.stderr}
+${result2.stdout}`)) {
       return {
         current,
         latest: null,
@@ -2976,13 +3284,13 @@ ${result.stdout}`)) {
       };
     }
     throw new CoordinatorError(
-      `Could not check private releases for '${PROJECT_REPOSITORY}': ${commandFailure(result)}.`,
+      `Could not check private releases for '${PROJECT_REPOSITORY}': ${commandFailure(result2)}.`,
       "UPDATE_CHECK_FAILED"
     );
   }
   let release;
   try {
-    release = JSON.parse(result.stdout);
+    release = JSON.parse(result2.stdout);
   } catch {
     throw new CoordinatorError(
       "GitHub returned an invalid latest-release response.",
@@ -3006,25 +3314,28 @@ ${result.stdout}`)) {
 }
 function applyUpdate(tag, options = {}) {
   parseReleaseTag(tag);
-  return runCommand(
+  const stdio = options.stdio ?? "inherit";
+  const result2 = runCommand(
     "npm",
     [
       "install",
       "--global",
       `git+https://github.com/${PROJECT_REPOSITORY}.git#${tag}`
     ],
-    { stdio: options.stdio ?? "inherit" }
+    { stdio }
   );
+  runCommand("coordinator", ["install"], { stdio });
+  return result2;
 }
 
 // src/workspace/initialize.ts
 import {
-  existsSync as existsSync11,
-  lstatSync as lstatSync3,
+  existsSync as existsSync10,
+  lstatSync as lstatSync4,
   mkdirSync as mkdirSync4,
   realpathSync as realpathSync3
 } from "fs";
-import path14 from "path";
+import path13 from "path";
 function repositoryCloneUrl(url) {
   return /^[^/:]+\/[^/]+$/.test(url) ? `git@github.com:${url}.git` : url;
 }
@@ -3040,17 +3351,17 @@ function git2(root, argumentsList) {
 }
 function pathExists(value2) {
   try {
-    lstatSync3(value2);
+    lstatSync4(value2);
     return true;
   } catch {
     return false;
   }
 }
-function canonicalPath(value2) {
+function canonicalPath2(value2) {
   try {
     return realpathSync3(value2);
   } catch {
-    return path14.resolve(value2);
+    return path13.resolve(value2);
   }
 }
 function githubRepository(value2) {
@@ -3062,8 +3373,8 @@ function repositoryUrlsMatch(expectedInput, actualInput) {
   const expectedGithub = githubRepository(expected);
   const actualGithub = githubRepository(actualInput);
   if (expectedGithub && actualGithub) return expectedGithub === actualGithub;
-  if (path14.isAbsolute(expected) && path14.isAbsolute(actualInput)) {
-    return canonicalPath(expected) === canonicalPath(actualInput);
+  if (path13.isAbsolute(expected) && path13.isAbsolute(actualInput)) {
+    return canonicalPath2(expected) === canonicalPath2(actualInput);
   }
   return expected.replace(/\/+$/, "") === actualInput.replace(/\/+$/, "");
 }
@@ -3104,7 +3415,7 @@ function configuredSubmodule(root, repository) {
   return { key, url: url.stdout };
 }
 function validateMaterializedRepository(root, repository) {
-  const repositoryDirectory = path14.join(root, repository.path);
+  const repositoryDirectory = path13.join(root, repository.path);
   if (!pathExists(repositoryDirectory)) {
     throw new CoordinatorError(
       `Repository '${repository.id}' is not materialized at '${repository.path}'.`,
@@ -3132,7 +3443,7 @@ function validateMaterializedRepository(root, repository) {
     ["rev-parse", "--show-toplevel"],
     true
   );
-  if (topLevel.status !== 0 || canonicalPath(topLevel.stdout) !== canonicalPath(repositoryDirectory)) {
+  if (topLevel.status !== 0 || canonicalPath2(topLevel.stdout) !== canonicalPath2(repositoryDirectory)) {
     throw existingRepositoryError(repository, "the destination is not that submodule's Git worktree");
   }
   const superproject = gitResult(
@@ -3140,7 +3451,7 @@ function validateMaterializedRepository(root, repository) {
     ["rev-parse", "--show-superproject-working-tree"],
     true
   );
-  if (superproject.status !== 0 || canonicalPath(superproject.stdout) !== canonicalPath(root)) {
+  if (superproject.status !== 0 || canonicalPath2(superproject.stdout) !== canonicalPath2(root)) {
     throw existingRepositoryError(repository, "the Git worktree belongs to another superproject");
   }
   const head = gitResult(repositoryDirectory, ["rev-parse", "HEAD"], true);
@@ -3164,11 +3475,11 @@ function validateMaterializedRepository(root, repository) {
 }
 function validateExistingDestinations(root, manifest) {
   const existing = manifest.repositories.filter(
-    (repository) => pathExists(path14.join(root, repository.path))
+    (repository) => pathExists(path13.join(root, repository.path))
   );
   if (!existing.length) return;
   const topLevel = gitResult(root, ["rev-parse", "--show-toplevel"], true);
-  if (topLevel.status !== 0 || canonicalPath(topLevel.stdout) !== canonicalPath(root)) {
+  if (topLevel.status !== 0 || canonicalPath2(topLevel.stdout) !== canonicalPath2(root)) {
     throw existingRepositoryError(
       existing[0],
       "the coordinator root is not an existing Git worktree"
@@ -3179,7 +3490,7 @@ function validateExistingDestinations(root, manifest) {
   }
 }
 function coordinatorBranchForInitialization(root) {
-  if (!pathExists(path14.join(root, ".git"))) return "main";
+  if (!pathExists(path13.join(root, ".git"))) return "main";
   const current = gitResult(
     root,
     ["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -3277,7 +3588,7 @@ function validateNativeConfiguration(root, manifest) {
 }
 function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   const manifest = coordinatorManifestSchema.parse(input);
-  const root = path14.resolve(directory);
+  const root = path13.resolve(directory);
   const dryRun = options.dryRun ?? false;
   const force = options.force ?? false;
   const addSubmodules = options.addSubmodules ?? true;
@@ -3290,7 +3601,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   if (pathExists(root)) validateExistingDestinations(root, manifest);
   const initialBranches = resolveInitialBranches(root, manifest);
   const initiallyMissing = manifest.repositories.filter(
-    (repository) => !pathExists(path14.join(root, repository.path))
+    (repository) => !pathExists(path13.join(root, repository.path))
   );
   if (!addSubmodules && installHooks && initiallyMissing.length) {
     throw new CoordinatorError(
@@ -3298,9 +3609,9 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
       "SUBMODULES_REQUIRED_FOR_INTEGRATION"
     );
   }
-  if (!existsSync11(root) && !dryRun) mkdirSync4(root, { recursive: true });
-  const gitDirectory = path14.join(root, ".git");
-  const createdGitRepository = !existsSync11(gitDirectory);
+  if (!existsSync10(root) && !dryRun) mkdirSync4(root, { recursive: true });
+  const gitDirectory = path13.join(root, ".git");
+  const createdGitRepository = !existsSync10(gitDirectory);
   if (createdGitRepository && !dryRun) {
     mkdirSync4(root, { recursive: true });
     runCommand("git", ["init", "--initial-branch=main", root]);
@@ -3309,7 +3620,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   const added = [];
   if (addSubmodules && !dryRun) {
     for (const repository of manifest.repositories) {
-      const repositoryDirectory = path14.join(root, repository.path);
+      const repositoryDirectory = path13.join(root, repository.path);
       if (pathExists(repositoryDirectory)) continue;
       const initialBranch = initialBranches.get(repository.id);
       const branchArguments = initialBranch.existsOnRemote ? ["-b", initialBranch.name] : [];
@@ -3326,12 +3637,12 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
     }
   }
   const materialized = manifest.repositories.filter(
-    (repository) => pathExists(path14.join(root, repository.path))
+    (repository) => pathExists(path13.join(root, repository.path))
   );
   for (const repository of materialized) {
     validateMaterializedRepository(root, repository);
   }
-  const missingSubmodules = manifest.repositories.filter((repository) => !pathExists(path14.join(root, repository.path))).map((repository) => repository.id);
+  const missingSubmodules = manifest.repositories.filter((repository) => !pathExists(path13.join(root, repository.path))).map((repository) => repository.id);
   if (!dryRun && installHooks && missingSubmodules.length) {
     throw new CoordinatorError(
       `Cannot install Git integration because these declared submodules are not materialized: ${missingSubmodules.join(", ")}. No hooks, attach, or invariant check were run.`,
@@ -3342,7 +3653,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
     for (const repository of manifest.repositories) {
       if (repository.agent.skills.length) continue;
       repository.agent.skills = discoverSkillSources(
-        path14.join(root, repository.path)
+        path13.join(root, repository.path)
       ).map((source) => ({ source }));
     }
     const discoveredManifestPlan = planFile(
@@ -3356,10 +3667,10 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   const sync = dryRun ? null : synchronizeWorkspace(root, manifest, generatorVersion, { force });
   if (!dryRun) validateNativeConfiguration(root, manifest);
   if (!dryRun && installHooks) {
-    installGitRuntime(root, {}, gitStdio);
-    invokeGitCoordinator("install", root, { stdio: gitStdio });
-    invokeGitCoordinator("attach", root, { stdio: gitStdio });
-    invokeGitCoordinator("check", root, { stdio: gitStdio });
+    installMachineGitRuntime({ stdio: gitStdio });
+    installWorkspaceGitIntegration(root, { stdio: gitStdio });
+    invokeGitRuntime("attach", root, { stdio: gitStdio });
+    invokeGitRuntime("check", root, { stdio: gitStdio });
   }
   const gitIntegration = dryRun ? {
     attached: false,
@@ -3373,7 +3684,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   } : installHooks ? {
     attached: true,
     configurationValidated: true,
-    detail: "Native coordinator.yaml Git configuration, submodule topology, branch attachment, and Git Coordinator invariant validated.",
+    detail: "Native coordinator.yaml Git configuration, submodule topology, branch attachment, and embedded Git runtime invariant validated.",
     hooksInstalled: true,
     invariantChecked: true,
     missingSubmodules: [],
@@ -3382,7 +3693,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   } : {
     attached: false,
     configurationValidated: true,
-    detail: "Configuration-only mode (--no-hooks): native coordinator.yaml Git configuration and materialized submodules were validated; runtime bootstrap, hooks, attach, and the runtime invariant check were intentionally skipped.",
+    detail: "Configuration-only mode (--no-hooks): native coordinator.yaml Git configuration and materialized submodules were validated; runtime installation, hooks, attach, and the runtime invariant check were intentionally skipped.",
     hooksInstalled: false,
     invariantChecked: false,
     missingSubmodules,
@@ -3399,13 +3710,13 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
 }
 
 // src/workspace/migrate.ts
-import { existsSync as existsSync12, readFileSync as readFileSync9 } from "fs";
-import path15 from "path";
+import { existsSync as existsSync11, readFileSync as readFileSync10 } from "fs";
+import path14 from "path";
 function slug2(value2) {
   return value2.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 function submoduleUrl(root, repositoryPath) {
-  const result = runCommand(
+  const result2 = runCommand(
     "git",
     [
       "-C",
@@ -3418,7 +3729,7 @@ function submoduleUrl(root, repositoryPath) {
     ],
     { allowFailure: true }
   );
-  const line = result.stdout.split("\n").find((entry) => entry.trim().endsWith(` ${repositoryPath}`));
+  const line = result2.stdout.split("\n").find((entry) => entry.trim().endsWith(` ${repositoryPath}`));
   if (!line) return repositoryPath;
   const key = line.split(/\s+/)[0].replace(/\.path$/, ".url");
   return runCommand("git", ["-C", root, "config", "-f", ".gitmodules", "--get", key], {
@@ -3430,10 +3741,10 @@ function inlineWorkspace(root, legacy, repositories) {
   if (!settings || (settings.coordinatorToken ?? "$coordinator") !== "$coordinator") {
     return null;
   }
-  if (typeof settings.path !== "string" || !settings.path || settings.path === "." || path15.isAbsolute(settings.path) || settings.path.split(/[\\/]/).includes("..")) {
+  if (typeof settings.path !== "string" || !settings.path || settings.path === "." || path14.isAbsolute(settings.path) || settings.path.split(/[\\/]/).includes("..")) {
     return null;
   }
-  const normalizedWorkspacePath = path15.posix.normalize(
+  const normalizedWorkspacePath = path14.posix.normalize(
     settings.path.replaceAll("\\", "/")
   );
   if (["coordinator.yaml", ".git-coordinator.json"].includes(
@@ -3444,11 +3755,11 @@ function inlineWorkspace(root, legacy, repositories) {
       "INVALID_LEGACY_CONFIGURATION"
     );
   }
-  const workspacePath = path15.join(root, settings.path);
-  if (!existsSync12(workspacePath)) return null;
+  const workspacePath = path14.join(root, settings.path);
+  if (!existsSync11(workspacePath)) return null;
   let parsed;
   try {
-    parsed = JSON.parse(readFileSync9(workspacePath, "utf8"));
+    parsed = JSON.parse(readFileSync10(workspacePath, "utf8"));
   } catch {
     return null;
   }
@@ -3485,14 +3796,14 @@ function inlineWorkspace(root, legacy, repositories) {
   };
 }
 function migrateLegacyWorkspaceWithMetadata(rootInput) {
-  const root = path15.resolve(rootInput);
-  const configurationPath = path15.join(root, ".git-coordinator.json");
-  if (!existsSync12(configurationPath)) {
+  const root = path14.resolve(rootInput);
+  const configurationPath = path14.join(root, ".git-coordinator.json");
+  if (!existsSync11(configurationPath)) {
     throw new CoordinatorError(`${configurationPath} does not exist.`);
   }
   let legacy;
   try {
-    legacy = JSON.parse(readFileSync9(configurationPath, "utf8"));
+    legacy = JSON.parse(readFileSync10(configurationPath, "utf8"));
   } catch (error) {
     throw new CoordinatorError(
       `.git-coordinator.json is invalid: ${error instanceof Error ? error.message : String(error)}`
@@ -3506,7 +3817,7 @@ function migrateLegacyWorkspaceWithMetadata(rootInput) {
     [".claude", "claude"],
     [".cursor", "cursor"],
     [".opencode", "opencode"]
-  ].filter(([directory]) => existsSync12(path15.join(root, directory))).map(([, tool]) => tool);
+  ].filter(([directory]) => existsSync11(path14.join(root, directory))).map(([, tool]) => tool);
   const repositories = legacy.repositories.map((repository) => {
     if (!repository.id || !repository.path) {
       throw new CoordinatorError("Legacy repository entry is missing id or path.");
@@ -3522,7 +3833,7 @@ function migrateLegacyWorkspaceWithMetadata(rootInput) {
   const embedded = inlineWorkspace(root, legacy, repositories);
   const manifestInput = {
     schemaVersion: embedded || !legacy.workspaceManifest ? 2 : 1,
-    name: slug2(path15.basename(root)),
+    name: slug2(path14.basename(root)),
     remote: legacy.remote ?? "origin",
     repositories,
     agents: {
@@ -3589,28 +3900,28 @@ function parseTools(value2) {
   if (invalid.length) throw new CoordinatorError(`Unknown agent tools: ${invalid.join(", ")}`);
   return tools;
 }
-function summarizeChanges(result) {
+function summarizeChanges(result2) {
   return {
-    changed: result.changed,
-    git: result.git.action,
-    agents: changedPlans(result.agents.files).map((file) => ({
+    changed: result2.changed,
+    git: result2.git.action,
+    agents: changedPlans(result2.agents.files).map((file) => ({
       path: file.relativePath,
       action: file.action
     })),
-    skills: result.agents.skills,
-    ci: changedPlans(result.ci.files).map((file) => ({
+    skills: result2.agents.skills,
+    ci: changedPlans(result2.ci.files).map((file) => ({
       path: file.relativePath,
       action: file.action
     }))
   };
 }
-function renderDoctor(result, color) {
+function renderDoctor(result2, color) {
   const style = {
     pass: (value2) => color ? pc3.green(value2) : value2,
     warn: (value2) => color ? pc3.yellow(value2) : value2,
     fail: (value2) => color ? pc3.red(value2) : value2
   };
-  return result.checks.map((item) => {
+  return result2.checks.map((item) => {
     const icon = item.status === "pass" ? "\u25CF" : item.status === "warn" ? "\u25C6" : "\xD7";
     return `${style[item.status](icon)} ${item.label.padEnd(24)} ${item.detail}`;
   }).join("\n");
@@ -3625,17 +3936,17 @@ async function showStatus(program2) {
 }
 async function showDoctor(program2) {
   const loaded = loadManifest();
-  const result = runDoctor(loaded.root, loaded.manifest, VERSION);
+  const result2 = runDoctor(loaded.root, loaded.manifest, VERSION);
   const options = globals(program2);
-  if (options.json) writeJson(result);
+  if (options.json) writeJson(result2);
   else {
-    process.stdout.write(`${renderDoctor(result, options.color)}
+    process.stdout.write(`${renderDoctor(result2, options.color)}
 `);
     process.stdout.write(
-      result.healthy ? pc3.green("\nWorkspace ready.\n") : pc3.red("\nWorkspace needs attention.\n")
+      result2.healthy ? pc3.green("\nWorkspace ready.\n") : pc3.red("\nWorkspace needs attention.\n")
     );
   }
-  if (!result.healthy) process.exitCode = 1;
+  if (!result2.healthy) process.exitCode = 1;
 }
 async function home(program2) {
   const root = findWorkspaceRoot();
@@ -3657,8 +3968,8 @@ async function home(program2) {
   const action = await promptDashboardAction();
   if (action === "sync") {
     const loaded = loadManifest(root);
-    const result = synchronizeWorkspace(loaded.root, loaded.manifest, VERSION);
-    process.stdout.write(result.changed ? "Workspace synchronized.\n" : "Workspace already synchronized.\n");
+    const result2 = synchronizeWorkspace(loaded.root, loaded.manifest, VERSION);
+    process.stdout.write(result2.changed ? "Workspace synchronized.\n" : "Workspace already synchronized.\n");
   } else if (action === "doctor") {
     await showDoctor(program2);
   } else if (action === "status") {
@@ -3674,7 +3985,7 @@ if (jsonRequested) {
 }
 program.exitOverride();
 program.name("coordinator").description("Beautiful multi-repository Git, agent, and delivery coordination.").version(VERSION).option("--json", "print machine-readable JSON", false).option("--no-color", "disable terminal colors").showSuggestionAfterError().showHelpAfterError().action(async () => home(program));
-program.command("init").description("initialize a coordinator in an empty or existing directory").argument("[directory]", "workspace directory", ".").option("-n, --name <name>", "workspace name").option("-r, --repo <spec>", "repository role=owner/repo[,path]", collect, []).option("--tools <tools>", "comma-separated agent runtimes", "codex,claude").option("--discover-skills", "discover committed skills after cloning", false).option("--no-submodules", "write configuration without cloning repositories").option("--no-hooks", "configuration only: skip runtime bootstrap, hooks, attach, and check").option("--dry-run", "show the initialization contract without writing").option("--force", "adopt conflicting generated destinations").action(async (directory, options) => {
+program.command("init").description("initialize a coordinator in an empty or existing directory").argument("[directory]", "workspace directory", ".").option("-n, --name <name>", "workspace name").option("-r, --repo <spec>", "repository role=owner/repo[,path]", collect, []).option("--tools <tools>", "comma-separated agent runtimes", "codex,claude").option("--discover-skills", "discover committed skills after cloning", false).option("--no-submodules", "write configuration without cloning repositories").option("--no-hooks", "configuration only: skip runtime installation, hooks, attach, and check").option("--dry-run", "show the initialization contract without writing").option("--force", "adopt conflicting generated destinations").action(async (directory, options) => {
   let manifest;
   let discoverSkills = options.discoverSkills;
   let interactive = false;
@@ -3689,7 +4000,7 @@ program.command("init").description("initialize a coordinator in an empty or exi
   } else {
     manifest = coordinatorManifestSchema.parse({
       schemaVersion: 2,
-      name: options.name ?? slug3(path16.basename(path16.resolve(directory))),
+      name: options.name ?? slug3(path15.basename(path15.resolve(directory))),
       remote: "origin",
       repositories: options.repo.map(repositoryFromSpec),
       agents: {
@@ -3699,7 +4010,7 @@ program.command("init").description("initialize a coordinator in an empty or exi
       }
     });
   }
-  const result = initializeWorkspace(directory, manifest, VERSION, {
+  const result2 = initializeWorkspace(directory, manifest, VERSION, {
     addSubmodules: options.submodules,
     dryRun: options.dryRun,
     discoverSkills,
@@ -3708,23 +4019,23 @@ program.command("init").description("initialize a coordinator in an empty or exi
     force: options.force
   });
   if (options.dryRun) {
-    writeJson({ directory: path16.resolve(directory), manifest, discoverSkills, result });
+    writeJson({ directory: path15.resolve(directory), manifest, discoverSkills, result: result2 });
     return;
   }
   if (interactive) finishWorkspacePrompt();
-  if (globals(program).json) writeJson(result);
+  if (globals(program).json) writeJson(result2);
   else {
     process.stdout.write(
       `Initialized ${manifest.name} with ${manifest.repositories.length} repositories.
 `
     );
-    process.stdout.write(`${result.gitIntegration.detail}
+    process.stdout.write(`${result2.gitIntegration.detail}
 `);
-    if (result.gitIntegration.missingSubmodules.length) {
+    if (result2.gitIntegration.missingSubmodules.length) {
       process.stdout.write(
         "Next: rerun init with the same repositories and submodule cloning enabled before using ordinary Git.\n"
       );
-    } else if (result.gitIntegration.mode === "configuration-only") {
+    } else if (result2.gitIntegration.mode === "configuration-only") {
       process.stdout.write(
         "Next: coordinator git install && coordinator git attach && coordinator git check\n"
       );
@@ -3744,21 +4055,21 @@ program.command("demo").description("render a deterministic product dashboard").
 program.command("doctor").description("validate the complete workspace contract").action(() => showDoctor(program));
 program.command("sync").description("synchronize agent, skill, and CI outputs and retire an owned legacy Git adapter").option("--check", "fail when generated outputs are stale").option("--force", "adopt conflicting generated destinations").action((options) => {
   const loaded = loadManifest();
-  const result = synchronizeWorkspace(loaded.root, loaded.manifest, VERSION, options);
-  const summary = summarizeChanges(result);
+  const result2 = synchronizeWorkspace(loaded.root, loaded.manifest, VERSION, options);
+  const summary = summarizeChanges(result2);
   if (globals(program).json) writeJson(summary);
   else if (options.check) {
     process.stdout.write(
-      `${result.changed ? "Generated workspace files are stale" : "Generated workspace files are current"}.
+      `${result2.changed ? "Generated workspace files are stale" : "Generated workspace files are current"}.
 `
     );
   } else {
     process.stdout.write(
-      `${result.changed ? "Workspace synchronized; generated files updated" : "Workspace already synchronized"}.
+      `${result2.changed ? "Workspace synchronized; generated files updated" : "Workspace already synchronized"}.
 `
     );
   }
-  if (options.check && result.changed) process.exitCode = 1;
+  if (options.check && result2.changed) process.exitCode = 1;
 });
 var agents = program.command("agents").description("manage tool-specific agents and portable skills");
 for (const mode of ["sync", "check"]) {
@@ -3767,15 +4078,15 @@ for (const mode of ["sync", "check"]) {
     mode === "sync" ? "adopt conflicting generated destinations" : "preview changes for conflicting unmanaged destinations"
   ).action((options) => {
     const loaded = loadManifest();
-    const result = synchronizeAgents(loaded.root, loaded.manifest, VERSION, {
+    const result2 = synchronizeAgents(loaded.root, loaded.manifest, VERSION, {
       check: mode === "check",
       force: options.force
     });
     const summary = {
       managed: loaded.manifest.agents.manage !== false,
-      changed: result.changed,
-      skills: result.skills,
-      files: changedPlans(result.files).map((file) => file.relativePath)
+      changed: result2.changed,
+      skills: result2.skills,
+      files: changedPlans(result2.files).map((file) => file.relativePath)
     };
     if (globals(program).json) writeJson(summary);
     else if (loaded.manifest.agents.manage === false) {
@@ -3784,76 +4095,87 @@ for (const mode of ["sync", "check"]) {
       );
     } else if (mode === "check") {
       process.stdout.write(
-        `${result.skills.length} skills; ${result.changed ? "generated agent files are stale" : "generated agent files are current"}.
+        `${result2.skills.length} skills; ${result2.changed ? "generated agent files are stale" : "generated agent files are current"}.
 `
       );
     } else {
       process.stdout.write(
-        `${result.skills.length} skills; ${result.changed ? "agent files synchronized and updated" : "agent files already synchronized"}.
+        `${result2.skills.length} skills; ${result2.changed ? "agent files synchronized and updated" : "agent files already synchronized"}.
 `
       );
     }
-    if (mode === "check" && result.changed) process.exitCode = 1;
+    if (mode === "check" && result2.changed) process.exitCode = 1;
   });
 }
 var ci = program.command("ci").description("generate coordinated GitHub Actions delivery workflows");
 for (const mode of ["sync", "check"]) {
   ci.command(mode).description(mode === "sync" ? "generate CI/CD files" : "verify generated CI/CD files").option("--force", "adopt conflicting generated destinations").action((options) => {
     const loaded = loadManifest();
-    const result = synchronizeCi(loaded.root, loaded.manifest, {
+    const result2 = synchronizeCi(loaded.root, loaded.manifest, {
       check: mode === "check",
       force: options.force
     });
-    if (globals(program).json) writeJson(result);
+    if (globals(program).json) writeJson(result2);
     else if (mode === "check") {
       process.stdout.write(
-        `${result.changed ? "Generated CI/CD files are stale" : "Generated CI/CD files are current"}.
+        `${result2.changed ? "Generated CI/CD files are stale" : "Generated CI/CD files are current"}.
 `
       );
     } else {
       process.stdout.write(
-        `${result.changed ? "CI/CD synchronized; generated files updated" : "CI/CD already synchronized"}.
+        `${result2.changed ? "CI/CD synchronized; generated files updated" : "CI/CD already synchronized"}.
 `
       );
     }
-    if (mode === "check" && result.changed) process.exitCode = 1;
+    if (mode === "check" && result2.changed) process.exitCode = 1;
   });
 }
-var git3 = program.command("git").description("operate the Git Coordinator compatibility runtime");
-for (const command of ["install", "attach", "check"]) {
+var git3 = program.command("git").description("operate the embedded Git runtime");
+for (const command of ["install", "uninstall", "attach", "check"]) {
   git3.command(command).description(
-    command === "install" ? "install the pinned runtime and this workspace's Git integration" : `${command} the Git Coordinator workspace integration`
+    command === "install" ? "install the embedded runtime and this workspace's Git integration" : command === "uninstall" ? "remove this workspace's Git integration" : `${command} the workspace Git integration`
   ).action(() => {
     const root = findWorkspaceRoot() ?? process.cwd();
     const json = globals(program).json;
-    const runtime = command === "install" ? installGitRuntime(root, {}, json ? "pipe" : "inherit") : null;
-    const result = invokeGitCoordinator(command, root, {
+    const runtime = command === "install" ? installMachineGitRuntime({ stdio: json ? "pipe" : "inherit" }) : null;
+    const result2 = command === "install" ? installWorkspaceGitIntegration(root, {
+      stdio: json ? "pipe" : "inherit"
+    }) : command === "uninstall" ? uninstallWorkspaceGitIntegration(root, {
+      stdio: json ? "pipe" : "inherit"
+    }) : invokeGitRuntime(command, root, {
       stdio: json ? "pipe" : "inherit"
     });
     if (json) {
       writeJson({
         command,
         root,
-        runtime: runtime ? { status: runtime.status, stdout: runtime.stdout, stderr: runtime.stderr } : null,
-        result
+        runtime,
+        result: result2
       });
     }
-    if (result.status !== 0) process.exitCode = result.status;
+    if ("status" in result2 && result2.status !== 0) {
+      process.exitCode = result2.status;
+    }
   });
 }
 program.command("compose").description("run Docker Compose from the local.compose manifest configuration").argument("[args...]", "arguments forwarded to docker compose").allowUnknownOption(true).allowExcessArguments(true).helpOption(false).action((argumentsList) => {
   const loaded = loadManifest();
-  const result = runLocalCompose(loaded.root, loaded.manifest, argumentsList);
-  if (result.status !== 0) process.exitCode = result.status;
+  const result2 = runLocalCompose(loaded.root, loaded.manifest, argumentsList);
+  if (result2.status !== 0) process.exitCode = result2.status;
 });
 program.command("install").description("install or refresh the transparent Git runtime on this machine").action(() => {
   const json = globals(program).json;
-  const result = installGitRuntime(
-    process.cwd(),
-    {},
-    json ? "pipe" : "inherit"
-  );
-  if (json) writeJson(result);
+  const result2 = installMachineGitRuntime({
+    stdio: json ? "pipe" : "inherit"
+  });
+  if (json) writeJson(result2);
+});
+program.command("uninstall").description("remove the managed transparent Git runtime from this machine").action(() => {
+  const json = globals(program).json;
+  const result2 = uninstallMachineGitRuntime({
+    stdio: json ? "pipe" : "inherit"
+  });
+  if (json) writeJson(result2);
 });
 program.command("update").description("check for or install the latest private release").option("--apply", "install the latest release").action((options) => {
   const status = checkForUpdate(VERSION);
@@ -3879,7 +4201,7 @@ program.command("update").description("check for or install the latest private r
   }
 });
 program.command("migrate").description("create coordinator.yaml from an existing .git-coordinator.json").argument("[directory]", "legacy workspace", ".").option("--write", "write coordinator.yaml instead of printing it").option("--adopt-git", "remove legacy Git files after absorbing their configuration").option("--force", "replace an existing project-owned manifest").action((directory, options) => {
-  const root = path16.resolve(directory);
+  const root = path15.resolve(directory);
   const migration = migrateLegacyWorkspaceWithMetadata(root);
   const manifest = migration.manifest;
   const content = renderManifest(manifest);
@@ -3914,11 +4236,11 @@ program.command("migrate").description("create coordinator.yaml from an existing
     }
   }
   applyFilePlans(plans);
-  const result = plans.map((plan) => ({
+  const result2 = plans.map((plan) => ({
     path: plan.path,
     action: plan.action
   }));
-  if (globals(program).json) writeJson(result);
+  if (globals(program).json) writeJson(result2);
   else {
     for (const plan of plans) process.stdout.write(`${plan.action}: ${plan.path}
 `);
@@ -3955,12 +4277,12 @@ function handleCliError(error) {
 }
 var execution = directComposeArguments ? Promise.resolve().then(() => {
   const loaded = loadManifest();
-  const result = runLocalCompose(
+  const result2 = runLocalCompose(
     loaded.root,
     loaded.manifest,
     directComposeArguments
   );
-  if (result.status !== 0) process.exitCode = result.status;
+  if (result2.status !== 0) process.exitCode = result2.status;
 }) : program.parseAsync(process.argv);
 execution.catch(handleCliError);
 //# sourceMappingURL=cli.js.map

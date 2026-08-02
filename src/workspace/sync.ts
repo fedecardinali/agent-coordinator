@@ -5,7 +5,7 @@ import {
   type FilePlan,
 } from "../core/files.js";
 import type { CoordinatorManifest } from "../core/schema.js";
-import { yamlNativeGitRuntimeActive } from "../git/adapter.js";
+import { yamlNativeGitRuntimeActive } from "../git/install.js";
 import { synchronizeAgents, type AgentSyncResult } from "../agents/sync.js";
 import { synchronizeCi, type CiSyncResult } from "../ci/sync.js";
 import {

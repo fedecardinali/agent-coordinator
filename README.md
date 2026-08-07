@@ -61,7 +61,7 @@ coordinator.yaml
 ├── native Git + branch selection      → transparent multi-repository Git
 ├── optional local Compose             → one-file development orchestration
 ├── AGENTS.md + tool-specific agents   → repository ownership and delegation
-├── .agents/skills + lockfile          → committed portable capabilities
+├── .agents/skills + lockfile          → relative source links + pinned expectations
 └── GitHub Actions workflows           → gitlink-aware deployment dispatch
 ```
 
@@ -75,7 +75,12 @@ flatten repositories or erase their independent histories.
 - Node.js 20.12 or newer
 - Git
 - [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login` for
-  the interactive repository picker and private release updates
+  the GitHub repository picker and private release updates
+- For the Bitbucket Cloud picker, an Atlassian account email and
+  [scoped API token](https://support.atlassian.com/bitbucket-cloud/docs/using-api-tokens/),
+  supplied interactively or as `BITBUCKET_EMAIL` and
+  `BITBUCKET_API_TOKEN`; the token needs `read:repository:bitbucket`, and the
+  credentials are used only for discovery and are not written to the workspace
 
 Agent Coordinator owns the complete contract, including the transparent Git
 runtime. One package, one version, and one `coordinator` executable install and
@@ -136,12 +141,13 @@ coordinator init
 
 The wizard:
 
-1. Selects existing repositories from a GitHub user or organization.
+1. Selects one or both hosting providers, then existing repositories from a
+   GitHub owner and/or Bitbucket Cloud workspace.
 2. Assigns a stable role id and branch policy to each repository.
 3. Selects the coding tools that should receive project agents.
 4. Optionally discovers committed skills from the selected repositories.
-5. Initializes the root Git repository, adds submodules, writes the manifest,
-   and synchronizes generated files.
+5. Initializes the root Git repository, adds each repository and all of its
+   nested submodules, writes the manifest, and synchronizes generated files.
 6. Installs the embedded Git runtime and workspace integration, attaches
    policy-resolved child branches, and verifies the Git invariant, unless
    `--no-hooks` is selected.
@@ -158,16 +164,43 @@ git commit -m "Initialize coordinated workspace"
 manifest and submodules without installing the runtime or hooks, attaching
 branches, or running the runtime check.
 
+If a nested gitlink pins a commit that its remote no longer exposes, interactive
+initialization stops before generating skills or hooks and offers only verified
+repair candidates: the nearest previous reachable pin and the remote default
+branch HEAD. Before applying anything, the wizard previews the exact SHA change.
+With explicit approval it creates one local commit in the clean writable parent
+repository, updates the coordinator gitlink, and retries initialization. It
+never chooses a fallback silently and the repair operation itself never pushes.
+A later ordinary coordinated `git push` can publish that local repair commit.
+
+Resume an interrupted initialization without selecting the repositories again:
+
+```sh
+coordinator init . --resume
+```
+
+In a non-interactive terminal, add `--discover-skills` when that work should be
+part of the resumed initialization. Automatic repair remains interactive
+because creating a commit always requires explicit approval.
+
 For automation or a non-interactive terminal, declare repositories explicitly:
 
 ```sh
 coordinator init ~/Developer/acme-coordinator \
   --name acme \
   --repo backend=acme/api,services/api \
-  --repo frontend=acme/web,apps/web \
+  --repo frontend=bitbucket:acme/web,apps/web \
   --tools codex,claude \
   --discover-skills
 ```
+
+The legacy `owner/repository` shorthand remains GitHub-compatible. Use
+`bitbucket:workspace/repository` for Bitbucket Cloud, or pass a complete SSH or
+credential-free HTTPS clone URL for either host. Embedded URL credentials,
+query parameters, and fragments are rejected; configure Git credentials
+separately. A single manifest may contain repositories from both hosts;
+coordinated CI/CD remains GitHub Actions-only, so deployment components must
+reference GitHub repositories.
 
 Preview the initialization contract without writing anything:
 
@@ -254,7 +287,7 @@ agents:
     - cursor
     - opencode
   maxParallel: 4
-  skillCollision: namespace
+  skillCollision: error
 
 deployments:
   tokenSecret: SUBREPO_ACTIONS_TOKEN
@@ -303,7 +336,7 @@ coordinator sync --check
 | Claude Code | `.claude/CLAUDE.md`, `.claude/agents/*.md`, `.claude/commands/<workspace>/*.md` |
 | Cursor | `.cursor/agents/*.md` |
 | OpenCode | `.opencode/agents/*.md` |
-| Portable skills | `.agents/skills/*`, `.coordinator/agents.lock.json` |
+| Portable skills | `.agents/skills/*` relative links, `.coordinator/agents.lock.json` v2 |
 | Delivery | `.coordinator/runtime/deployment-plan.mjs`, `.github/workflows/coordinator-deploy-*.yml` |
 
 Delivery files are generated only when the manifest declares `deployments`.
@@ -426,13 +459,22 @@ For each repository, the generated agent:
 The selected tool remains responsible for deciding when and how to use those
 agents.
 
-### Skills from committed child trees
+### Source-direct skills
 
-Skills are materialized into the canonical `.agents/skills` registry from the
-exact commit pinned by the coordinator's gitlink, not from an uncommitted
-working-tree copy. Nested submodule gitlinks are followed recursively. Each
-generated lock entry records its source repository, source path, pinned commit,
-Git tree object, and content digest.
+The canonical `.agents/skills/<name>` registry contains relative symbolic links
+to skill directories inside the selected repositories or their initialized
+nested submodules. Agent Coordinator resolves each source through the exact
+commits pinned by the coordinator and nested gitlinks, verifies that the
+checkout is clean and at those commits, and publishes a link only when its
+target remains inside the workspace. Moving the complete workspace or creating
+a coordinated worktree therefore does not turn the links into machine-specific
+absolute paths.
+
+`.coordinator/agents.lock.json` uses schema version 2. Each entry records the
+canonical skill name, owning repository, repository-relative source, pinned
+source commit, Git tree object, `relative-symlink` materialization mode, and the
+expected relative link target. The lock is the auditable expected state; it is
+not a copied snapshot of the source directory.
 
 Interactive discovery recognizes committed skills under:
 
@@ -441,9 +483,29 @@ Interactive discovery recognizes committed skills under:
 .agents/flows/<flow-name>/SKILL.md
 ```
 
-When different repositories export different skills with the same name,
-`skillCollision: namespace` prefixes the repository id. Set it to `error` to
-require explicit unique names instead.
+Repositories may expose those directories through symbolic links into an
+initialized nested submodule. Discovery follows only links that remain inside
+the repository, stores the canonical committed source, and records whether the
+logical export is a `skill` or a `flow`.
+
+Every linked `SKILL.md` must declare a globally unique canonical kebab-case
+`name` in its frontmatter. That name is also the registry directory name.
+Source-direct links cannot rewrite frontmatter, so an explicit manifest `name`
+is accepted only when it equals the canonical source name. Flows follow the
+same rule and are not automatically prefixed with the repository id. If two
+exports declare the same name, synchronization fails and one source must be
+renamed. The legacy `skillCollision: namespace` value remains parseable for
+manifest compatibility, but it cannot resolve a collision in source-direct
+mode.
+
+Because the registry points directly at the child checkout, edits made through
+either path are immediately visible through the other. Those edits belong to
+the child repository; the root symlink and lockfile do not change merely
+because linked content became dirty. `coordinator agents check` and
+`coordinator doctor` reject a dirty source, a checkout that moved away from its
+gitlink, a changed link target, or a stale lock. Commit the source change in its
+own repository, update the coordinated gitlink, and synchronize again to record
+the new expected commit and tree.
 
 Synchronize only agent and skill outputs:
 
@@ -457,8 +519,31 @@ Verify them without writing:
 coordinator agents check
 ```
 
-Generated copies are not editing targets. Change the source skill in its child
-repository, commit it there, and synchronize again.
+The check output previews link creation, replacement, removal, adoption, and
+copy migration without writing the workspace. A normal sync automatically
+migrates an intact Agent Coordinator-managed schema-1 copy to a relative source
+link and rewrites the lock as schema 2:
+
+```sh
+coordinator agents check
+coordinator agents sync
+```
+
+If a managed copy was modified or replaced, or a desired registry destination
+is unmanaged, synchronization preserves it and stops. Review the explicit
+adoption preview before allowing replacement:
+
+```sh
+coordinator agents check --force
+coordinator agents sync --force
+```
+
+`--force` authorizes only the previewed registry destination and lockfile
+adoption. It does not bypass canonical-name, committed-tree, workspace-boundary,
+dirty-source, or gitlink validation. Link publication uses atomic symlink
+creation; managed-copy migration and generated-file publication retain
+same-filesystem backups. A failed agent synchronization rolls links, lockfile,
+and dependent agent files back before reporting the error.
 
 ## Coordinated CI/CD
 
@@ -517,7 +602,7 @@ doctor actions. In a non-interactive terminal it prints status and exits.
 `coordinator doctor` validates the complete local contract:
 
 - Supported Node.js and available Git
-- GitHub CLI installation and authentication status
+- GitHub CLI installation and authentication status for repository discovery and updates
 - Initialized child repositories
 - Child revisions matching root gitlinks
 - Native Git manifest compatibility and up-to-date agent, skill, and CI files
@@ -527,8 +612,10 @@ doctor actions. In a non-interactive terminal it prints status and exits.
 coordinator doctor
 ```
 
-GitHub CLI absence or missing authentication is reported as a warning. Broken
-repository, generated-file, or Git-runtime invariants fail the command.
+GitHub CLI absence or missing authentication is reported as a warning. Bitbucket
+credentials are intentionally not persisted or checked after interactive
+discovery; cloning uses the user's configured SSH access. Broken repository,
+generated-file, or Git-runtime invariants fail the command.
 
 ## Updates
 
@@ -607,13 +694,13 @@ need `--force`.
 | Command | Purpose |
 |---|---|
 | `coordinator` | Initialize interactively when no manifest exists, or show status and interactive actions inside a workspace. |
-| `coordinator init [directory]` | Initialize a workspace interactively or from `--repo` flags. Supports `--dry-run`, `--no-submodules`, `--no-hooks`, and `--force`. |
+| `coordinator init [directory]` | Initialize a workspace interactively or from `--repo` flags. Supports `--resume`, `--dry-run`, `--no-submodules`, `--no-hooks`, and `--force`. |
 | `coordinator status` | Render the current workspace dashboard. |
 | `coordinator doctor` | Validate tools, repositories, gitlinks, generated state, and Git runtime. |
 | `coordinator sync` | Synchronize agents, skills, and optional CI/CD outputs; remove only an owned obsolete Git adapter. |
 | `coordinator sync --check` | Exit non-zero when any generated output is stale. |
-| `coordinator agents sync` | Materialize tool-specific agents and committed skills. |
-| `coordinator agents check` | Check agent and skill outputs without writing. |
+| `coordinator agents sync` | Synchronize tool-specific agents and relative source skill links; migrate intact managed copies. |
+| `coordinator agents check` | Preview agent, skill-link, lockfile, and managed-copy migration changes without writing. |
 | `coordinator ci sync` | Generate configured delivery files. |
 | `coordinator ci check` | Check delivery files without writing. |
 | `coordinator git install` | Refresh the embedded machine runtime, then install this workspace's Git integration. |
@@ -644,12 +731,16 @@ Agent Coordinator is conservative around user-owned state:
 - Mutating generators have a corresponding preview or check path.
 - Unmanaged destinations are never silently overwritten.
 - `--force` is an explicit adoption decision, not a default repair mechanism.
-- Generated file paths reject workspace escapes and symlink ancestors; file
-  publication uses unpredictable same-directory staging and atomic renames.
-- Skill copies come from committed Git trees, so dirty source changes are never
-  accidentally published as generated capabilities.
-- Skill directories stage on the workspace filesystem before replacement, and
-  their ownership lock is written atomically.
+- Generated file paths and skill-registry ancestors reject workspace escapes
+  and symbolic links; the managed skill entry itself is an expected relative
+  symlink to a separately validated in-workspace source.
+- Skill links are planned only from clean checkouts at coordinator-pinned Git
+  trees. Later working-tree edits are visible immediately by design, while
+  `agents check` and `doctor` report the source as dirty until it is committed
+  and the gitlink and schema-2 lock are synchronized.
+- Skill links use no-overwrite symlink creation; managed-copy migrations and
+  generated files preserve same-filesystem backups for rollback and publish
+  their ownership lock with the dependent agent files as one transaction.
 - Secret values never belong in `coordinator.yaml` or its lockfiles; only the
   GitHub secret name is stored.
 - Machine installation replaces or removes only recognized Agent Coordinator
@@ -660,7 +751,7 @@ Agent Coordinator is conservative around user-owned state:
 Agent Coordinator currently does **not**:
 
 - Run agents, select models, schedule tasks, or maintain an agent queue.
-- Create child GitHub repositories; initialization selects existing ones.
+- Create child GitHub or Bitbucket Cloud repositories; initialization selects existing ones.
 - Replace child CI pipelines or deploy directly to Railway, ECS, Vercel, or
   another platform.
 - Provision GitHub secrets or environment protection rules.
@@ -726,8 +817,9 @@ branch.
 src/core/        manifest validation, file planning, errors, commands
 src/workspace/   initialization, synchronization, legacy migration
 src/git/         embedded transparent Git runtime and safe installer
-src/agents/      project-agent renderers and committed skill materialization
+src/agents/      project-agent renderers and relative source skill links
 src/ci/          embedded deployment runtime and GitHub Actions generation
+src/hosting/     Git hosting discovery adapters
 src/status/      workspace inspection
 src/doctor/      health checks
 src/update/      private release checks and explicit updates
@@ -742,4 +834,7 @@ than real projects.
 
 ## License
 
-Private software. No open-source license is granted at this stage.
+Agent Coordinator is available under the [Apache License 2.0](LICENSE).
+The license permits use, modification, and distribution for commercial
+purposes, including internal use by companies such as Salesforce, subject to
+the license terms and required notices.

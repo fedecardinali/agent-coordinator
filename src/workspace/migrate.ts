@@ -208,7 +208,7 @@ export function migrateLegacyWorkspaceWithMetadata(
       manage: false,
       tools: tools.length ? tools : ["codex"],
       maxParallel: 4,
-      skillCollision: "namespace",
+      skillCollision: "error",
     },
   };
   const manifest = embedded

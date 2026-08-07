@@ -160,9 +160,11 @@ ${workspaceManifest}
 
 ## Portable skills
 
-Materialized skills live at \`.agents/skills/<skill-name>/SKILL.md\`. They are
-generated from committed child-repository trees. Do not edit generated copies;
-change the source and run \`coordinator agents sync\`.
+Linked skills live at \`.agents/skills/<skill-name>/SKILL.md\`. Each registry
+entry is a relative symlink to its committed source in a pinned child checkout.
+Do not replace registry links. Editing through one changes its owning child
+checkout immediately; commit the change in that repository, then run
+\`coordinator agents sync\`.
 
 ## Git invariant
 

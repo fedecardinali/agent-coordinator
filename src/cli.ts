@@ -2,6 +2,7 @@ import path from "node:path";
 import { Command, CommanderError } from "commander";
 import pc from "picocolors";
 import { synchronizeAgents } from "./agents/sync.js";
+import type { SkillLinkAction } from "./agents/skills.js";
 import { synchronizeCi } from "./ci/sync.js";
 import { errorMessage, CoordinatorError } from "./core/errors.js";
 import {
@@ -34,13 +35,26 @@ import { renderDashboard } from "./ui/dashboard.js";
 import { runLocalCompose } from "./local/compose.js";
 import {
   finishWorkspacePrompt,
+  promptNestedSubmoduleRepair,
   promptDashboardAction,
+  promptResumeWorkspace,
   promptWorkspaceManifest,
+  reportNestedSubmoduleRepair,
 } from "./ui/prompts.js";
 import { VERSION } from "./version.js";
 import { applyUpdate, checkForUpdate } from "./update/check.js";
-import { initializeWorkspace, repositoryCloneUrl } from "./workspace/initialize.js";
+import {
+  initializeWorkspace,
+  repositoryCloneUrl,
+  type InitializeOptions,
+  type InitializeResult,
+} from "./workspace/initialize.js";
 import { migrateLegacyWorkspaceWithMetadata } from "./workspace/migrate.js";
+import {
+  applyNestedSubmoduleRepair,
+  NestedSubmoduleRepairRequiredError,
+  type NestedSubmoduleRepairResult,
+} from "./workspace/nested-repair.js";
 import { synchronizeWorkspace } from "./workspace/sync.js";
 
 interface GlobalOptions {
@@ -54,6 +68,36 @@ function globals(program: Command): GlobalOptions {
 
 function writeJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function renderSkillActions(
+  actions: SkillLinkAction[],
+  preview: boolean,
+): string {
+  if (!actions.length) return "";
+  const labels = preview
+    ? {
+        "adopt-link": "would adopt existing link",
+        "create-link": "would create link",
+        "delete-managed": "would remove managed entry",
+        "migrate-copy": "would migrate managed copy",
+        "replace-link": "would replace registry entry",
+      }
+    : {
+        "adopt-link": "adopted existing link",
+        "create-link": "created link",
+        "delete-managed": "removed managed entry",
+        "migrate-copy": "migrated managed copy",
+        "replace-link": "replaced registry entry",
+      };
+  return [
+    preview ? "Skill link plan:" : "Skill link changes:",
+    ...actions.map((action) => {
+      const destination = `.agents/skills/${action.name}`;
+      const target = action.linkTarget ? ` -> ${action.linkTarget}` : "";
+      return `  - ${labels[action.action]} ${destination}${target}`;
+    }),
+  ].join("\n");
 }
 
 function collect(value: string, previous: string[]): string[] {
@@ -73,7 +117,7 @@ function repositoryFromSpec(
   const separator = spec.indexOf("=");
   if (separator <= 0 || separator === spec.length - 1) {
     throw new CoordinatorError(
-      `Invalid repository '${spec}'. Use role=owner/repository or role=clone-url.`,
+      `Invalid repository '${spec}'. Use role=owner/repository, role=bitbucket:workspace/repository, or role=clone-url.`,
     );
   }
   const id = spec.slice(0, separator);
@@ -113,6 +157,8 @@ function summarizeChanges(result: ReturnType<typeof synchronizeWorkspace>): obje
       action: file.action,
     })),
     skills: result.agents.skills,
+    skillActions: result.agents.skillActions,
+    skillMigrations: result.agents.skillMigrations,
     ci: changedPlans(result.ci.files).map((file) => ({
       path: file.relativePath,
       action: file.action,
@@ -158,6 +204,56 @@ async function showDoctor(program: Command): Promise<void> {
   if (!result.healthy) process.exitCode = 1;
 }
 
+const MAX_NESTED_SUBMODULE_REPAIRS = 8;
+
+async function initializeWorkspaceWithRepairs(
+  directory: string,
+  manifest: CoordinatorManifest,
+  options: InitializeOptions,
+  interactive: boolean,
+): Promise<{
+  repairs: NestedSubmoduleRepairResult[];
+  result: InitializeResult;
+}> {
+  const repairs: NestedSubmoduleRepairResult[] = [];
+  const appliedPlans = new Set<string>();
+  while (true) {
+    try {
+      return {
+        repairs,
+        result: initializeWorkspace(directory, manifest, VERSION, options),
+      };
+    } catch (error) {
+      if (!(error instanceof NestedSubmoduleRepairRequiredError) || !interactive) {
+        throw error;
+      }
+      if (
+        repairs.length >= MAX_NESTED_SUBMODULE_REPAIRS ||
+        appliedPlans.has(error.plan.id)
+      ) {
+        throw new CoordinatorError(
+          `Nested submodule repair could not make progress for plan '${error.plan.id}'. Partial workspace preserved at ${error.plan.root}.`,
+          "NESTED_SUBMODULE_REPAIR_RETRY_EXHAUSTED",
+        );
+      }
+      const candidateRevision = await promptNestedSubmoduleRepair(error.plan);
+      if (!candidateRevision) {
+        throw new CoordinatorError(
+          `Nested repair was not applied. Partial workspace preserved at ${error.plan.root}. Rerun 'coordinator init --resume' after repairing the remote or when ready to approve a verified local repair.`,
+          "INCOMPLETE_INITIALIZATION",
+        );
+      }
+      const repair = applyNestedSubmoduleRepair(error.plan, {
+        approveLocalCommit: true,
+        candidateRevision,
+      });
+      appliedPlans.add(error.plan.id);
+      repairs.push(repair);
+      reportNestedSubmoduleRepair(repair);
+    }
+  }
+}
+
 async function home(program: Command): Promise<void> {
   const root = findWorkspaceRoot();
   if (!root) {
@@ -166,9 +262,12 @@ async function home(program: Command): Promise<void> {
       return;
     }
     const prompted = await promptWorkspaceManifest(process.cwd());
-    initializeWorkspace(process.cwd(), prompted.manifest, VERSION, {
-      discoverSkills: prompted.discoverSkills,
-    });
+    await initializeWorkspaceWithRepairs(
+      process.cwd(),
+      prompted.manifest,
+      { discoverSkills: prompted.discoverSkills },
+      !globals(program).json && Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    );
     finishWorkspacePrompt();
     await showStatus(program);
     return;
@@ -211,9 +310,15 @@ program
   .description("initialize a coordinator in an empty or existing directory")
   .argument("[directory]", "workspace directory", ".")
   .option("-n, --name <name>", "workspace name")
-  .option("-r, --repo <spec>", "repository role=owner/repo[,path]", collect, [])
+  .option(
+    "-r, --repo <spec>",
+    "repository role=owner/repo, role=bitbucket:workspace/repo, or role=clone-url[,path]",
+    collect,
+    [],
+  )
   .option("--tools <tools>", "comma-separated agent runtimes", "codex,claude")
   .option("--discover-skills", "discover committed skills after cloning", false)
+  .option("--resume", "resume an interrupted initialization from coordinator.yaml")
   .option("--no-submodules", "write configuration without cloning repositories")
   .option("--no-hooks", "configuration only: skip runtime installation, hooks, attach, and check")
   .option("--dry-run", "show the initialization contract without writing")
@@ -225,13 +330,34 @@ program
     discoverSkills: boolean;
     submodules: boolean;
     hooks: boolean;
+    resume?: boolean;
     dryRun?: boolean;
     force?: boolean;
   }) => {
+    let targetDirectory = directory;
     let manifest: CoordinatorManifest;
     let discoverSkills = options.discoverSkills;
     let interactive = false;
-    if (!options.repo.length) {
+    if (options.resume) {
+      if (options.repo.length || options.name) {
+        throw new CoordinatorError(
+          "--resume cannot be combined with --repo or --name; it uses the existing coordinator.yaml.",
+          "INVALID_RESUME_OPTIONS",
+        );
+      }
+      const loaded = loadManifest(directory);
+      targetDirectory = loaded.root;
+      manifest = loaded.manifest;
+      interactive =
+        !globals(program).json &&
+        Boolean(process.stdin.isTTY && process.stdout.isTTY);
+      if (interactive) {
+        discoverSkills = await promptResumeWorkspace(
+          loaded.root,
+          loaded.manifest.name,
+        );
+      }
+    } else if (!options.repo.length) {
       if (!process.stdin.isTTY) {
         throw new CoordinatorError("At least one --repo is required without an interactive terminal.");
       }
@@ -248,20 +374,35 @@ program
         agents: {
           tools: parseTools(options.tools),
           maxParallel: Math.min(4, options.repo.length),
-          skillCollision: "namespace",
+          skillCollision: "error",
         },
       });
     }
-    const result = initializeWorkspace(directory, manifest, VERSION, {
-      addSubmodules: options.submodules,
-      dryRun: options.dryRun,
-      discoverSkills,
-      gitStdio: globals(program).json ? "pipe" : "inherit",
-      installHooks: options.hooks,
-      force: options.force,
-    });
+    const initialized = await initializeWorkspaceWithRepairs(
+      targetDirectory,
+      manifest,
+      {
+        addSubmodules: options.submodules,
+        dryRun: options.dryRun,
+        discoverSkills,
+        gitStdio: globals(program).json ? "pipe" : "inherit",
+        installHooks: options.hooks,
+        force: options.force,
+      },
+      interactive &&
+        !globals(program).json &&
+        !options.dryRun &&
+        Boolean(process.stdout.isTTY),
+    );
+    const { repairs, result } = initialized;
     if (options.dryRun) {
-      writeJson({ directory: path.resolve(directory), manifest, discoverSkills, result });
+      writeJson({
+        directory: path.resolve(targetDirectory),
+        manifest,
+        discoverSkills,
+        repairs,
+        result,
+      });
       return;
     }
     if (interactive) finishWorkspacePrompt();
@@ -271,6 +412,11 @@ program
         `Initialized ${manifest.name} with ${manifest.repositories.length} repositories.\n`,
       );
       process.stdout.write(`${result.gitIntegration.detail}\n`);
+      if (repairs.length) {
+        process.stdout.write(
+          `${repairs.length} local nested-submodule repair commit${repairs.length === 1 ? "" : "s"} created; no push was performed. A later coordinated push can publish ${repairs.length === 1 ? "it" : "them"}.\n`,
+        );
+      }
       if (result.gitIntegration.missingSubmodules.length) {
         process.stdout.write(
           "Next: rerun init with the same repositories and submodule cloning enabled before using ordinary Git.\n",
@@ -303,20 +449,33 @@ program
   .command("sync")
   .description("synchronize agent, skill, and CI outputs and retire an owned legacy Git adapter")
   .option("--check", "fail when generated outputs are stale")
-  .option("--force", "adopt conflicting generated destinations")
+  .option("--force", "preview or adopt conflicting generated and skill destinations")
   .action((options: { check?: boolean; force?: boolean }) => {
     const loaded = loadManifest();
     const result = synchronizeWorkspace(loaded.root, loaded.manifest, VERSION, options);
     const summary = summarizeChanges(result);
     if (globals(program).json) writeJson(summary);
     else if (options.check) {
+      const migrationDetail = result.agents.skillMigrations.length
+        ? ` ${result.agents.skillMigrations.length} managed skill ${result.agents.skillMigrations.length === 1 ? "copy would migrate" : "copies would migrate"} to relative source ${result.agents.skillMigrations.length === 1 ? "link" : "links"}.`
+        : "";
       process.stdout.write(
-        `${result.changed ? "Generated workspace files are stale" : "Generated workspace files are current"}.\n`,
+        `${result.changed ? "Generated workspace outputs are stale" : "Generated workspace outputs are current"}.${migrationDetail}\n`,
       );
     } else {
+      const migrationDetail = result.agents.skillMigrations.length
+        ? ` Migrated ${result.agents.skillMigrations.length} managed skill ${result.agents.skillMigrations.length === 1 ? "copy" : "copies"} to relative source ${result.agents.skillMigrations.length === 1 ? "link" : "links"}.`
+        : "";
       process.stdout.write(
-        `${result.changed ? "Workspace synchronized; generated files updated" : "Workspace already synchronized"}.\n`,
+        `${result.changed ? "Workspace synchronized; generated outputs updated" : "Workspace already synchronized"}.${migrationDetail}\n`,
       );
+    }
+    const renderedSkillActions = renderSkillActions(
+      result.agents.skillActions,
+      Boolean(options.check),
+    );
+    if (!globals(program).json && renderedSkillActions) {
+      process.stdout.write(`${renderedSkillActions}\n`);
     }
     if (options.check && result.changed) process.exitCode = 1;
   });
@@ -325,12 +484,16 @@ const agents = program.command("agents").description("manage tool-specific agent
 for (const mode of ["sync", "check"] as const) {
   agents
     .command(mode)
-    .description(mode === "sync" ? "materialize agents and committed skills" : "verify generated agents and skills")
+    .description(
+      mode === "sync"
+        ? "synchronize agents and relative source skill links"
+        : "preview generated agents and relative source skill links",
+    )
     .option(
       "--force",
       mode === "sync"
-        ? "adopt conflicting generated destinations"
-        : "preview changes for conflicting unmanaged destinations",
+        ? "adopt or replace conflicting generated and skill destinations"
+        : "preview adoption or replacement of conflicting skill destinations",
     )
     .action((options: { force?: boolean }) => {
       const loaded = loadManifest();
@@ -342,6 +505,8 @@ for (const mode of ["sync", "check"] as const) {
         managed: loaded.manifest.agents.manage !== false,
         changed: result.changed,
         skills: result.skills,
+        skillActions: result.skillActions,
+        skillMigrations: result.skillMigrations,
         files: changedPlans(result.files).map((file) => file.relativePath),
       };
       if (globals(program).json) writeJson(summary);
@@ -351,13 +516,26 @@ for (const mode of ["sync", "check"] as const) {
         );
       }
       else if (mode === "check") {
+        const migrationDetail = result.skillMigrations.length
+          ? ` ${result.skillMigrations.length} managed skill ${result.skillMigrations.length === 1 ? "copy would migrate to a relative source link" : "copies would migrate to relative source links"}.`
+          : "";
         process.stdout.write(
-          `${result.skills.length} skills; ${result.changed ? "generated agent files are stale" : "generated agent files are current"}.\n`,
+          `${result.skills.length} skill links; ${result.changed ? "generated agent and skill outputs are stale" : "generated agent and skill outputs are current"}.${migrationDetail}\n`,
         );
       } else {
+        const migrationDetail = result.skillMigrations.length
+          ? ` Migrated ${result.skillMigrations.length} managed skill ${result.skillMigrations.length === 1 ? "copy to a relative source link" : "copies to relative source links"}.`
+          : "";
         process.stdout.write(
-          `${result.skills.length} skills; ${result.changed ? "agent files synchronized and updated" : "agent files already synchronized"}.\n`,
+          `${result.skills.length} skill links; ${result.changed ? "agent and skill outputs synchronized" : "agent and skill outputs already synchronized"}.${migrationDetail}\n`,
         );
+      }
+      const renderedSkillActions = renderSkillActions(
+        result.skillActions,
+        mode === "check",
+      );
+      if (!globals(program).json && renderedSkillActions) {
+        process.stdout.write(`${renderedSkillActions}\n`);
       }
       if (mode === "check" && result.changed) process.exitCode = 1;
     });
@@ -573,6 +751,9 @@ function handleCliError(error: unknown): void {
     writeJson({
       error: errorMessage(error),
       code: error instanceof CoordinatorError ? error.code : "UNEXPECTED_ERROR",
+      ...(error instanceof NestedSubmoduleRepairRequiredError
+        ? { repairPlan: error.plan }
+        : {}),
     });
   } else {
     process.stderr.write(`${pc.red("×")} ${errorMessage(error)}\n`);

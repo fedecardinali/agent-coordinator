@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { parse, stringify } from "yaml";
 import { CoordinatorError } from "./errors.js";
+import { parseRepositoryIdentity } from "./repository-url.js";
 import {
   coordinatorManifestSchema,
   type CoordinatorManifest,
@@ -65,9 +66,8 @@ export function renderManifest(manifest: CoordinatorManifest): string {
 }
 
 export function githubRepositoryName(url: string): string | null {
-  const normalized = url
-    .replace(/^git@github\.com:/, "")
-    .replace(/^https?:\/\/github\.com\//, "")
-    .replace(/\.git$/, "");
-  return /^[^/]+\/[^/]+$/.test(normalized) ? normalized : null;
+  const identity = parseRepositoryIdentity(url);
+  return identity?.provider === "github"
+    ? `${identity.namespace}/${identity.repository}`
+    : null;
 }

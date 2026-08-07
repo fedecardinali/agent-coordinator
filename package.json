@@ -12,6 +12,7 @@
     "docs/assets",
     "templates",
     "README.md",
+    "LICENSE",
     "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
@@ -46,5 +47,5 @@
   "overrides": {
     "esbuild": "^0.28.1"
   },
-  "license": "UNLICENSED"
+  "license": "Apache-2.0"
 }

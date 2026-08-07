@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { synchronizeSkills } from "../src/agents/skills.js";
+import {
+  discoverSkillSources,
+  synchronizeSkills,
+} from "../src/agents/skills.js";
 import { CoordinatorError } from "../src/core/errors.js";
 import { coordinatorManifestSchema } from "../src/core/schema.js";
 import { git, REAL_GIT, temporaryDirectory } from "./helpers.js";
@@ -43,6 +48,71 @@ function assertCoordinatorError(
     return true;
   });
 }
+
+function assertRelativeSkillLink(
+  root: string,
+  name: string,
+  sourceWorkspacePath: string,
+): string {
+  const destination = path.join(root, ".agents", "skills", name);
+  assert.equal(lstatSync(destination).isSymbolicLink(), true);
+  const linkTarget = readlinkSync(destination);
+  assert.equal(path.isAbsolute(linkTarget), false);
+  assert.equal(
+    linkTarget,
+    path.posix.relative(
+      ".agents/skills",
+      sourceWorkspacePath.split(path.sep).join("/"),
+    ),
+  );
+  assert.equal(
+    path.resolve(path.dirname(destination), linkTarget),
+    path.resolve(root, sourceWorkspacePath),
+  );
+  return linkTarget;
+}
+
+test("skill discovery preserves logical exports while returning safe canonical paths", (context) => {
+  const temporary = temporaryDirectory("agent-coordinator-skill-discovery-");
+  context.after(() => rmSync(temporary, { recursive: true }));
+  const repository = path.join(temporary, "repository");
+  const external = path.join(temporary, "external");
+  const canonicalSkill = path.join(
+    repository,
+    "vendor",
+    "runtime",
+    "skills",
+    "demo",
+  );
+  const canonicalFlow = path.join(
+    repository,
+    "vendor",
+    "runtime",
+    "flows",
+    "review",
+  );
+  initializeRepository(repository);
+  writeSkill(canonicalSkill, "demo", "canonical export");
+  writeSkill(canonicalFlow, "review", "canonical flow export");
+  mkdirSync(path.join(repository, ".agents"), { recursive: true });
+  symlinkSync(
+    path.join("..", "vendor", "runtime", "skills"),
+    path.join(repository, ".agents", "skills"),
+    "dir",
+  );
+  symlinkSync(
+    path.join("..", "vendor", "runtime", "flows"),
+    path.join(repository, ".agents", "flows"),
+    "dir",
+  );
+  writeSkill(path.join(external, "escape"), "escape", "external export");
+  symlinkSync(external, path.join(repository, ".agents", "external"), "dir");
+
+  assert.deepEqual(discoverSkillSources(repository), [
+    { kind: "flow", source: "vendor/runtime/flows/review" },
+    { kind: "skill", source: "vendor/runtime/skills/demo" },
+  ]);
+});
 
 test("skills follow recursive coordinator gitlinks and reject dirty or mismatched checkouts", (context) => {
   const temporary = temporaryDirectory("agent-coordinator-skill-pinning-");
@@ -103,6 +173,16 @@ test("skills follow recursive coordinator gitlinks and reject dirty or mismatche
 
   const first = synchronizeSkills(root, manifest, "0.1.0");
   assert.equal(first.changed, true);
+  const topLevelLinkTarget = assertRelativeSkillLink(
+    root,
+    "api-contracts",
+    "api/.agents/skills/api-contracts",
+  );
+  const nestedLinkTarget = assertRelativeSkillLink(
+    root,
+    "nested-contracts",
+    "api/vendor/shared/.agents/skills/nested-contracts",
+  );
   assert.match(
     readFileSync(
       path.join(root, ".agents", "skills", "api-contracts", "SKILL.md"),
@@ -129,14 +209,50 @@ test("skills follow recursive coordinator gitlinks and reject dirty or mismatche
   const lock = JSON.parse(
     readFileSync(path.join(root, ".coordinator", "agents.lock.json"), "utf8"),
   ) as {
+    generatedBy: string;
+    schemaVersion: number;
     skills: Array<{
+      linkTarget: string;
+      materialization: string;
       name: string;
+      repository: string;
+      source: string;
       sourceCommit: string;
       treeOid: string;
     }>;
   };
+  assert.equal(lock.schemaVersion, 2);
+  assert.equal(lock.generatedBy, "agent-coordinator");
   const topLevel = lock.skills.find((skill) => skill.name === "api-contracts");
   const nested = lock.skills.find((skill) => skill.name === "nested-contracts");
+  assert.deepEqual(
+    topLevel && {
+      linkTarget: topLevel.linkTarget,
+      materialization: topLevel.materialization,
+      repository: topLevel.repository,
+      source: topLevel.source,
+    },
+    {
+      linkTarget: topLevelLinkTarget,
+      materialization: "relative-symlink",
+      repository: "api",
+      source: ".agents/skills/api-contracts",
+    },
+  );
+  assert.deepEqual(
+    nested && {
+      linkTarget: nested.linkTarget,
+      materialization: nested.materialization,
+      repository: nested.repository,
+      source: nested.source,
+    },
+    {
+      linkTarget: nestedLinkTarget,
+      materialization: "relative-symlink",
+      repository: "api",
+      source: "vendor/shared/.agents/skills/nested-contracts",
+    },
+  );
   assert.equal(topLevel?.sourceCommit, childCommit);
   assert.equal(
     topLevel?.treeOid,

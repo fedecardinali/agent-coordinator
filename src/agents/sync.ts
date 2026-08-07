@@ -2,7 +2,6 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { CoordinatorError } from "../core/errors.js";
 import {
-  applyFilePlans,
   changedPlans,
   planFile,
   planFileDeletion,
@@ -20,11 +19,16 @@ import {
   renderOpenCodeAgent,
   renderRootAgents,
 } from "./renderers.js";
-import { synchronizeSkills } from "./skills.js";
+import {
+  synchronizeSkills,
+  type SkillLinkAction,
+} from "./skills.js";
 
 export interface AgentSyncResult {
   changed: boolean;
   files: FilePlan[];
+  skillActions: SkillLinkAction[];
+  skillMigrations: string[];
   skills: string[];
 }
 
@@ -165,21 +169,46 @@ export function synchronizeAgents(
   options: { check?: boolean | undefined; force?: boolean | undefined } = {},
 ): AgentSyncResult {
   if (manifest.agents.manage === false) {
-    return { changed: false, files: [], skills: [] };
+    return {
+      changed: false,
+      files: [],
+      skillActions: [],
+      skillMigrations: [],
+      skills: [],
+    };
   }
   const force = options.force ?? false;
-  const skillResult = synchronizeSkills(root, manifest, generatorVersion, {
-    check: options.check,
+  const skillPreview = synchronizeSkills(root, manifest, generatorVersion, {
+    check: true,
     force,
   });
-  const files = renderAgentFiles(root, manifest, skillResult.names, force);
+  const files = renderAgentFiles(root, manifest, skillPreview.names, force);
   const desiredPaths = new Set(files.map((file) => file.relativePath));
   for (const stalePath of generatedAgentPaths(root)) {
     if (!desiredPaths.has(stalePath)) {
       files.push(planFileDeletion(root, stalePath, owned));
     }
   }
-  const changed = skillResult.changed || changedPlans(files).length > 0;
-  if (!options.check) applyFilePlans(files);
-  return { changed, files, skills: skillResult.names };
+  const changed = skillPreview.changed || changedPlans(files).length > 0;
+  if (options.check) {
+    return {
+      changed,
+      files,
+      skillActions: skillPreview.actions,
+      skillMigrations: skillPreview.migrations,
+      skills: skillPreview.names,
+    };
+  }
+  const skillResult = synchronizeSkills(root, manifest, generatorVersion, {
+    dependentFilePlans: files,
+    expectedSkills: skillPreview.skills,
+    force,
+  });
+  return {
+    changed,
+    files,
+    skillActions: skillResult.actions,
+    skillMigrations: skillResult.migrations,
+    skills: skillResult.names,
+  };
 }

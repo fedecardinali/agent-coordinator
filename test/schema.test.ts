@@ -48,6 +48,27 @@ test("schemaVersion 2 keeps Git and local development in one manifest", () => {
   assert.equal(rendered.local.compose.override, manifest.local?.compose?.override);
 });
 
+test("new manifests default to canonical-name collision errors while legacy namespace remains readable", () => {
+  const defaults = coordinatorManifestSchema.parse({
+    schemaVersion: 2,
+    name: "canonical-skills",
+    repositories: [{ id: "api", path: "api", url: "org/api" }],
+  });
+  assert.equal(defaults.agents.skillCollision, "error");
+
+  const legacy = coordinatorManifestSchema.parse({
+    schemaVersion: 1,
+    name: "legacy-skill-namespace",
+    repositories: [{ id: "api", path: "api", url: "org/api" }],
+    agents: {
+      tools: ["codex"],
+      maxParallel: 1,
+      skillCollision: "namespace",
+    },
+  });
+  assert.equal(legacy.agents.skillCollision, "namespace");
+});
+
 test("inline workspace selection must contain exactly every repository id", () => {
   const missing = coordinatorManifestSchema.safeParse({
     schemaVersion: 2,
@@ -139,6 +160,103 @@ test("deployment components must reference declared repositories", () => {
   });
   assert.equal(result.success, false);
   if (!result.success) assert.match(result.error.message, /unknown repository 'frontend'/);
+});
+
+test("GitHub deployments reject Bitbucket Cloud repositories", () => {
+  const result = coordinatorManifestSchema.safeParse({
+    schemaVersion: 2,
+    name: "wrong-github-host",
+    repositories: [
+      { id: "backend", path: "api", url: "bitbucket:acme/api" },
+    ],
+    deployments: {
+      environments: {
+        staging: {
+          githubEnvironment: "staging",
+          components: {
+            backend: {
+              repository: "backend",
+              workflow: "deploy.yml",
+              state: { provider: "workflow-runs" },
+            },
+          },
+        },
+      },
+    },
+  });
+  assert.equal(result.success, false);
+  if (!result.success) {
+    assert.match(result.error.message, /must use a GitHub URL/);
+  }
+});
+
+test("GitHub-only deployments reject Bitbucket Pipelines configuration", () => {
+  const result = coordinatorManifestSchema.safeParse({
+    schemaVersion: 2,
+    name: "unsupported-pipelines",
+    repositories: [{ id: "backend", path: "api", url: "org/api" }],
+    deployments: {
+      provider: "bitbucket-pipelines",
+      apiEmailVariable: "BITBUCKET_API_EMAIL",
+      apiTokenVariable: "BITBUCKET_API_TOKEN",
+      environments: {
+        staging: {
+          githubEnvironment: "staging",
+          components: {
+            backend: {
+              repository: "backend",
+              workflow: "deploy.yml",
+              state: { provider: "workflow-runs" },
+            },
+          },
+        },
+      },
+    },
+  });
+  assert.equal(result.success, false);
+  if (!result.success) assert.match(result.error.message, /provider/);
+});
+
+test("repository URLs cannot persist embedded credentials", () => {
+  const result = coordinatorManifestSchema.safeParse({
+    schemaVersion: 2,
+    name: "credentialed-url",
+    repositories: [
+      {
+        id: "backend",
+        path: "api",
+        url: "https://account:secret@bitbucket.org/acme/api.git",
+      },
+    ],
+  });
+  assert.equal(result.success, false);
+  if (!result.success) assert.match(result.error.message, /must not embed credentials/);
+});
+
+test("mixed GitHub and Bitbucket workspaces may deploy only GitHub repositories", () => {
+  const result = coordinatorManifestSchema.safeParse({
+    schemaVersion: 2,
+    name: "mixed-hosts",
+    repositories: [
+      { id: "backend", path: "api", url: "ssh://git@github.com/acme/api.git" },
+      { id: "frontend", path: "web", url: "bitbucket:acme/web" },
+    ],
+    deployments: {
+      environments: {
+        staging: {
+          githubEnvironment: "staging",
+          components: {
+            backend: {
+              repository: "backend",
+              workflow: "deploy.yml",
+              state: { provider: "workflow-runs" },
+            },
+          },
+        },
+      },
+    },
+  });
+  assert.equal(result.success, true);
 });
 
 test("deployment names cannot escape generated workflow paths", () => {

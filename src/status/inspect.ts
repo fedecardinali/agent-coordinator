@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { runCommand } from "../core/command.js";
 import type { CoordinatorManifest, Repository } from "../core/schema.js";
@@ -46,6 +46,29 @@ function policyLabel(repository: Repository): string {
   if (repository.branch.mode === "fixed") return `fixed:${repository.branch.name}`;
   if (repository.branch.mode === "map") return "mapped";
   return "mirror";
+}
+
+function isWithin(base: string, candidate: string): boolean {
+  const relative = path.relative(base, candidate);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`))
+  );
+}
+
+function isReachableWorkspaceSkill(root: string, candidate: string): boolean {
+  try {
+    const rootRealPath = realpathSync(root);
+    const candidateRealPath = realpathSync(candidate);
+    return (
+      isWithin(rootRealPath, candidateRealPath) &&
+      existsSync(path.join(candidateRealPath, "SKILL.md"))
+    );
+  } catch {
+    return false;
+  }
 }
 
 function inspectRepository(
@@ -99,7 +122,12 @@ export function inspectWorkspace(
   const skillsDirectory = path.join(root, ".agents", "skills");
   const skills = existsSync(skillsDirectory)
     ? readdirSync(skillsDirectory, { withFileTypes: true }).filter(
-        (entry) => entry.isDirectory() && existsSync(path.join(skillsDirectory, entry.name, "SKILL.md")),
+        (entry) =>
+          (entry.isDirectory() || entry.isSymbolicLink()) &&
+          isReachableWorkspaceSkill(
+            root,
+            path.join(skillsDirectory, entry.name),
+          ),
       ).length
     : 0;
   const environments = Object.values(manifest.deployments?.environments ?? {});

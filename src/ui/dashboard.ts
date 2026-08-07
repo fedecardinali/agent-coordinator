@@ -69,7 +69,7 @@ export function renderDashboard(
   lines.push(
     row(
       status.agents.managed
-        ? `${c.ready("●")} ${status.agents.tools.join("  ")}   ${c.accent(String(status.agents.skills))} skills synced`
+        ? `${c.ready("●")} ${status.agents.tools.join("  ")}   ${c.accent(String(status.agents.skills))} skill links`
         : `${c.attention("◆")} ${status.agents.tools.join("  ")}   existing agent files unmanaged`,
     ),
   );

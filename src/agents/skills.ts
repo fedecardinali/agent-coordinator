@@ -4,13 +4,14 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   realpathSync,
   renameSync,
   rmSync,
-  writeFileSync,
+  statSync,
+  symlinkSync,
 } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { runCommand } from "../core/command.js";
 import { CoordinatorError } from "../core/errors.js";
@@ -18,6 +19,7 @@ import {
   applyFilePlans,
   planFile,
   safeGeneratedPath,
+  type FilePlan,
 } from "../core/files.js";
 import { sha256 } from "../core/hash.js";
 import type { CoordinatorManifest, Repository } from "../core/schema.js";
@@ -25,19 +27,25 @@ import type { CoordinatorManifest, Repository } from "../core/schema.js";
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 interface SkillCandidate {
-  explicitName: boolean;
   repository: Repository;
   source: string;
   sourceCommit: string;
+  sourceDirectory: string;
   sourceGitRoot: string;
   sourcePrefix: string;
-  sourceName: string;
+  sourceWorkspacePath: string;
   targetName: string;
   treeOid: string;
 }
 
+export interface DiscoveredSkillSource {
+  source: string;
+  kind: "flow" | "skill";
+}
+
 export interface MaterializedSkill {
-  digest: string;
+  linkTarget: string;
+  materialization: "relative-symlink";
   name: string;
   repository: string;
   source: string;
@@ -48,12 +56,45 @@ export interface MaterializedSkill {
 export interface AgentSkillLock {
   generatedBy: "agent-coordinator";
   generatorVersion: string;
-  schemaVersion: 1;
+  schemaVersion: 2;
   skills: MaterializedSkill[];
 }
 
+interface LegacyMaterializedSkill {
+  digest: string;
+  name: string;
+  repository: string;
+  source: string;
+  sourceCommit: string;
+  treeOid: string;
+}
+
+interface LegacyAgentSkillLock {
+  generatedBy: "agent-coordinator";
+  generatorVersion: string;
+  schemaVersion: 1;
+  skills: LegacyMaterializedSkill[];
+}
+
+type ParsedAgentSkillLock = AgentSkillLock | LegacyAgentSkillLock;
+
+export type SkillLinkActionKind =
+  | "adopt-link"
+  | "create-link"
+  | "delete-managed"
+  | "migrate-copy"
+  | "replace-link";
+
+export interface SkillLinkAction {
+  action: SkillLinkActionKind;
+  linkTarget: string | null;
+  name: string;
+}
+
 export interface SkillSyncResult {
+  actions: SkillLinkAction[];
   changed: boolean;
+  migrations: string[];
   names: string[];
   skills: MaterializedSkill[];
 }
@@ -168,6 +209,33 @@ function treeEntry(
   return match
     ? { mode: match[1]!, type: match[2]!, oid: match[3]! }
     : null;
+}
+
+function assertLinkableSkillTree(
+  repositoryDirectory: string,
+  commit: string,
+  relativePath: string,
+  label: string,
+): void {
+  const argumentsList = ["-C", repositoryDirectory, "ls-tree", "-r", "-z", commit];
+  if (relativePath) argumentsList.push("--", `:(literal)${relativePath}`);
+  const result = runCommand("git", argumentsList, { allowFailure: true });
+  if (result.status !== 0) {
+    throw new CoordinatorError(
+      `Could not inspect the pinned tree for ${label}: ${result.stderr || result.stdout || `exit ${result.status}`}.`,
+      "SKILL_PINNED_TREE_UNAVAILABLE",
+    );
+  }
+  for (const entry of result.stdout.split("\0").filter(Boolean)) {
+    const match = /^(\d{6})\s+(\w+)\s+[0-9a-f]{40,64}\t([\s\S]+)$/.exec(entry);
+    if (!match) continue;
+    if (match[1] === "120000" || match[1] === "160000") {
+      throw new CoordinatorError(
+        `${label} contains unsupported ${match[1] === "120000" ? "symbolic link" : "nested gitlink"} '${match[3]}'. Source-direct skills must be ordinary committed files and directories.`,
+        "SKILL_SOURCE_LINK_UNSUPPORTED",
+      );
+    }
+  }
 }
 
 function indexedGitlink(root: string, repository: Repository): string {
@@ -315,6 +383,7 @@ function sourceInformation(
   repository: Repository,
   source: string,
   explicitName: string | undefined,
+  _kind: "flow" | "skill" | undefined,
 ): SkillCandidate {
   const label = `Skill source '${repository.id}:${source}'`;
   const repositoryDirectory = safeExistingPath(
@@ -406,6 +475,12 @@ function sourceInformation(
       "SKILL_SOURCE_MISSING",
     );
   }
+  assertLinkableSkillTree(
+    sourceGitRoot,
+    sourceCommit,
+    sourcePrefix,
+    label,
+  );
   safeExistingPath(sourceDirectory, "SKILL.md", label);
   const skillPath = sourcePrefix ? `${sourcePrefix}/SKILL.md` : "SKILL.md";
   const skillEntry = treeEntry(sourceGitRoot, sourceCommit, skillPath);
@@ -431,24 +506,47 @@ function sourceInformation(
   const declared = /^---\s*\n[\s\S]*?^name:\s*["']?([^\n"']+)["']?\s*$[\s\S]*?^---\s*$/m.exec(
     committedSkill,
   )?.[1]?.trim();
-  const sourceName = declared || path.basename(source);
-  const isFlow = /(^|\/)\.agents\/flows\//.test(source);
-  const targetName = explicitName ?? (isFlow ? `${repository.id}-${sourceName}` : sourceName);
+  if (!declared) {
+    throw new CoordinatorError(
+      `Skill '${repository.id}:${source}' must declare a canonical name in SKILL.md frontmatter before it can be linked.`,
+      "INVALID_SKILL",
+    );
+  }
+  if (explicitName !== undefined && explicitName !== declared) {
+    throw new CoordinatorError(
+      `Skill '${repository.id}:${source}' requests alias '${explicitName}', but its canonical SKILL.md name is '${declared}'. Source-direct skill links cannot rewrite frontmatter; rename the source skill or remove the alias.`,
+      "SKILL_LINK_ALIAS_UNSUPPORTED",
+    );
+  }
+  const targetName = declared;
   if (!SKILL_NAME.test(targetName)) {
     throw new CoordinatorError(
       `Skill '${repository.id}:${source}' resolves to invalid portable name '${targetName}'.`,
       "INVALID_SKILL_NAME",
     );
   }
+  const sourceWorkspacePath = gitPath(
+    path.relative(context.rootRealPath, sourceDirectory),
+  );
+  if (
+    !sourceWorkspacePath ||
+    sourceWorkspacePath === ".." ||
+    sourceWorkspacePath.startsWith("../")
+  ) {
+    throw new CoordinatorError(
+      `Skill '${repository.id}:${source}' does not resolve to a linkable directory inside the coordinator workspace.`,
+      "SKILL_SOURCE_ESCAPE",
+    );
+  }
   return {
     repository,
     source,
     sourceCommit,
+    sourceDirectory,
     sourceGitRoot,
     sourcePrefix,
-    sourceName,
+    sourceWorkspacePath,
     targetName,
-    explicitName: explicitName !== undefined,
     treeOid: sourceTree.oid,
   };
 }
@@ -463,7 +561,13 @@ function resolveCandidates(
   const context = resolutionContext(root);
   const candidates = manifest.repositories.flatMap((repository) =>
     repository.agent.skills.map((skill) =>
-      sourceInformation(context, repository, skill.source, skill.name),
+      sourceInformation(
+        context,
+        repository,
+        skill.source,
+        skill.name,
+        skill.kind,
+      ),
     ),
   );
   const grouped = new Map<string, SkillCandidate[]>();
@@ -478,28 +582,12 @@ function resolveCandidates(
       resolved.push(collisions[0]!);
       continue;
     }
-    const uniqueTrees = new Set(collisions.map((candidate) => candidate.treeOid));
-    if (uniqueTrees.size === 1) {
-      resolved.push(collisions[0]!);
-      continue;
-    }
-    if (
-      manifest.agents.skillCollision === "error" ||
-      collisions.some((candidate) => candidate.explicitName)
-    ) {
-      throw new CoordinatorError(
-        `Skill name '${name}' has divergent sources: ${collisions
-          .map((candidate) => `${candidate.repository.id}:${candidate.source}`)
-          .join(", ")}. Assign explicit unique names.`,
-        "SKILL_COLLISION",
-      );
-    }
-    for (const collision of collisions) {
-      resolved.push({
-        ...collision,
-        targetName: `${collision.repository.id}-${collision.targetName}`,
-      });
-    }
+    throw new CoordinatorError(
+      `Skill name '${name}' has divergent sources: ${collisions
+        .map((candidate) => `${candidate.repository.id}:${candidate.source}`)
+        .join(", ")}. Source-direct skill links require one globally unique canonical SKILL.md name; automatic namespace rewriting is unavailable.`,
+      "SKILL_COLLISION",
+    );
   }
   const finalNames = new Set<string>();
   for (const candidate of resolved) {
@@ -512,37 +600,6 @@ function resolveCandidates(
     finalNames.add(candidate.targetName);
   }
   return resolved.sort((left, right) => left.targetName.localeCompare(right.targetName));
-}
-
-function archiveCandidate(candidate: SkillCandidate, destination: string): void {
-  mkdirSync(destination, { recursive: true });
-  const archivePath = `${destination}.tar`;
-  runCommand("git", [
-    "-C",
-    candidate.sourceGitRoot,
-    "archive",
-    "--format=tar",
-    "--output",
-    archivePath,
-    candidate.sourcePrefix
-      ? `${candidate.sourceCommit}:${candidate.sourcePrefix}`
-      : candidate.sourceCommit,
-  ]);
-  runCommand("tar", ["-xf", archivePath, "-C", destination]);
-  rmSync(archivePath);
-  const skillPath = path.join(destination, "SKILL.md");
-  const source = readFileSync(skillPath, "utf8");
-  const rewritten = source.replace(
-    /(^---\s*\n[\s\S]*?^name:\s*)[^\n]+/m,
-    `$1${candidate.targetName}`,
-  );
-  if (rewritten === source && !new RegExp(`^name:\\s*${candidate.targetName}$`, "m").test(source)) {
-    throw new CoordinatorError(
-      `Skill '${candidate.repository.id}:${candidate.source}' has no editable name frontmatter.`,
-      "INVALID_SKILL",
-    );
-  }
-  writeFileSync(skillPath, rewritten, { mode: 0o644 });
 }
 
 function directoryDigest(directory: string): string {
@@ -565,6 +622,11 @@ function directoryDigest(directory: string): string {
         pieces.push(Buffer.from(`${relative}\0`));
         pieces.push(readFileSync(absolute));
         pieces.push(Buffer.from("\0"));
+      } else {
+        throw new CoordinatorError(
+          `Generated skill contains unsupported filesystem entry '${relative}'.`,
+          "SKILL_UNSUPPORTED_ENTRY",
+        );
       }
     }
   };
@@ -572,46 +634,124 @@ function directoryDigest(directory: string): string {
   return sha256(Buffer.concat(pieces));
 }
 
-function parseLock(content: string): AgentSkillLock | null {
+function validOid(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40,64}$/.test(value);
+}
+
+function validLockSkillBase(value: unknown): value is {
+  name: string;
+  repository: string;
+  source: string;
+  sourceCommit: string;
+  treeOid: string;
+} {
+  if (typeof value !== "object" || value === null) return false;
+  const skill = value as Record<string, unknown>;
+  return (
+    typeof skill.name === "string" &&
+    SKILL_NAME.test(skill.name) &&
+    typeof skill.repository === "string" &&
+    SKILL_NAME.test(skill.repository) &&
+    typeof skill.source === "string" &&
+    Boolean(skill.source) &&
+    !/[\0\r\n]/.test(skill.source) &&
+    validOid(skill.sourceCommit) &&
+    validOid(skill.treeOid)
+  );
+}
+
+function validRelativeLink(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    Boolean(value) &&
+    !path.posix.isAbsolute(value) &&
+    !path.win32.isAbsolute(value) &&
+    !/[\0\r\n]/.test(value)
+  );
+}
+
+function parseLock(content: string): ParsedAgentSkillLock | null {
   try {
-    const value = JSON.parse(content) as Partial<AgentSkillLock>;
+    const value = JSON.parse(content) as Record<string, unknown>;
     if (
       value.generatedBy !== "agent-coordinator" ||
-      value.schemaVersion !== 1 ||
       typeof value.generatorVersion !== "string" ||
-      !Array.isArray(value.skills) ||
-      !value.skills.every(
-        (skill) =>
-          typeof skill === "object" &&
-          skill !== null &&
-          typeof skill.name === "string" &&
-          SKILL_NAME.test(skill.name),
-      )
+      !Array.isArray(value.skills)
     ) {
       return null;
     }
-    return value as AgentSkillLock;
+    const names = value.skills
+      .map((skill) =>
+        typeof skill === "object" && skill !== null
+          ? (skill as Record<string, unknown>).name
+          : null,
+      )
+      .filter((name): name is string => typeof name === "string");
+    if (new Set(names).size !== value.skills.length) return null;
+    if (value.schemaVersion === 1) {
+      if (
+        !value.skills.every(
+          (skill) =>
+            validLockSkillBase(skill) &&
+            typeof (skill as Record<string, unknown>).digest === "string" &&
+            /^[0-9a-f]{64}$/.test(
+              (skill as Record<string, unknown>).digest as string,
+            ),
+        )
+      ) {
+        return null;
+      }
+      return value as unknown as LegacyAgentSkillLock;
+    }
+    if (value.schemaVersion === 2) {
+      if (
+        !value.skills.every(
+          (skill) =>
+            validLockSkillBase(skill) &&
+            (skill as Record<string, unknown>).materialization ===
+              "relative-symlink" &&
+            validRelativeLink(
+              (skill as Record<string, unknown>).linkTarget,
+            ),
+        )
+      ) {
+        return null;
+      }
+      return value as unknown as AgentSkillLock;
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-function readLock(lockPath: string): AgentSkillLock | null {
+function readLock(lockPath: string): ParsedAgentSkillLock | null {
   if (!existsSync(lockPath)) return null;
   return parseLock(readFileSync(lockPath, "utf8"));
+}
+
+function lstatIfPresent(value: string): ReturnType<typeof lstatSync> | null {
+  try {
+    return lstatSync(value);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
 }
 
 function validateTarget(root: string, name: string): string {
   if (!SKILL_NAME.test(name)) {
     throw new CoordinatorError(`Unsafe generated skill name '${name}'.`);
   }
-  return safeGeneratedPath(root, path.join(".agents", "skills", name));
+  const skillsRoot = safeGeneratedPath(root, path.join(".agents", "skills"));
+  return path.join(skillsRoot, name);
 }
 
 interface PublishedSkillChange {
   backup: string | null;
   name: string;
   published: boolean;
+  publishedSnapshot: SkillDestinationSnapshot | null;
   target: string;
 }
 
@@ -650,10 +790,46 @@ function rollbackSkillChanges(
     try {
       assertDirectoryIdentity(skillsRoot, identity);
       const target = validateTarget(root, change.name);
-      if (change.published && existsSync(target)) {
-        renameSync(target, path.join(discardedRoot, change.name));
+      const current = destinationSnapshot(target);
+      if (change.published) {
+        if (
+          !change.publishedSnapshot ||
+          !snapshotsMatch(current, change.publishedSnapshot)
+        ) {
+          throw new CoordinatorError(
+            `Published skill link '${change.name}' changed before rollback; its current destination was preserved.`,
+            "SKILL_ROLLBACK_DESTINATION_CHANGED",
+          );
+        }
+        const discarded = path.join(discardedRoot, change.name);
+        renameSync(target, discarded);
+        if (
+          !snapshotsMatch(
+            destinationSnapshot(discarded),
+            change.publishedSnapshot,
+          )
+        ) {
+          if (destinationSnapshot(target).kind === "missing") {
+            renameSync(discarded, target);
+          }
+          throw new CoordinatorError(
+            `Published skill link '${change.name}' changed while rollback captured it; recovery data was preserved.`,
+            "SKILL_ROLLBACK_DESTINATION_CHANGED",
+          );
+        }
+      } else if (current.kind !== "missing") {
+        throw new CoordinatorError(
+          `Skill destination '${change.name}' was occupied before rollback; both it and the backup were preserved.`,
+          "SKILL_ROLLBACK_DESTINATION_CHANGED",
+        );
       }
-      if (change.backup && existsSync(change.backup)) {
+      if (change.backup && lstatIfPresent(change.backup)) {
+        if (destinationSnapshot(target).kind !== "missing") {
+          throw new CoordinatorError(
+            `Skill destination '${change.name}' is occupied; its backup was preserved.`,
+            "SKILL_ROLLBACK_DESTINATION_CHANGED",
+          );
+        }
         renameSync(change.backup, target);
       }
     } catch (error) {
@@ -665,11 +841,203 @@ function rollbackSkillChanges(
   return failures;
 }
 
+type SkillDestinationSnapshot =
+  | { kind: "directory"; dev: number; digest: string | null; ino: number }
+  | { kind: "missing" }
+  | { dev: number; ino: number; kind: "other" }
+  | { dev: number; ino: number; kind: "symlink"; linkTarget: string };
+
+interface ResolvedSkillLink {
+  candidate: SkillCandidate;
+  skill: MaterializedSkill;
+}
+
+interface PlannedSkillMutation {
+  action: SkillLinkAction;
+  desired: MaterializedSkill | null;
+  expected: SkillDestinationSnapshot;
+  target: string;
+}
+
+function destinationSnapshot(target: string): SkillDestinationSnapshot {
+  const status = lstatIfPresent(target);
+  if (!status) return { kind: "missing" };
+  if (status.isSymbolicLink()) {
+    return {
+      dev: Number(status.dev),
+      ino: Number(status.ino),
+      kind: "symlink",
+      linkTarget: readlinkSync(target),
+    };
+  }
+  if (status.isDirectory()) {
+    let digest: string | null = null;
+    try {
+      digest = directoryDigest(target);
+    } catch {
+      // A legacy copy containing links or unreadable entries is not intact.
+    }
+    return {
+      dev: Number(status.dev),
+      digest,
+      ino: Number(status.ino),
+      kind: "directory",
+    };
+  }
+  return {
+    dev: Number(status.dev),
+    ino: Number(status.ino),
+    kind: "other",
+  };
+}
+
+function snapshotsMatch(
+  left: SkillDestinationSnapshot,
+  right: SkillDestinationSnapshot,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function linkedSkill(
+  resolvedRoot: string,
+  candidate: SkillCandidate,
+): MaterializedSkill {
+  const linkTarget = path.posix.relative(
+    ".agents/skills",
+    candidate.sourceWorkspacePath,
+  );
+  if (!validRelativeLink(linkTarget) || linkTarget === ".") {
+    throw new CoordinatorError(
+      `Skill '${candidate.repository.id}:${candidate.source}' produced an unsafe registry link target.`,
+      "SKILL_LINK_TARGET_UNSAFE",
+    );
+  }
+  const target = validateTarget(resolvedRoot, candidate.targetName);
+  const resolvedTarget = path.resolve(
+    path.dirname(target),
+    linkTarget.split("/").join(path.sep),
+  );
+  let canonicalTarget: string;
+  try {
+    canonicalTarget = realpathSync(resolvedTarget);
+  } catch {
+    throw new CoordinatorError(
+      `Skill '${candidate.repository.id}:${candidate.source}' does not resolve to an initialized source directory.`,
+      "SKILL_SOURCE_MISSING",
+    );
+  }
+  if (canonicalTarget !== candidate.sourceDirectory) {
+    throw new CoordinatorError(
+      `Skill '${candidate.repository.id}:${candidate.source}' registry link does not resolve to its validated source.`,
+      "SKILL_LINK_TARGET_UNSAFE",
+    );
+  }
+  return {
+    linkTarget,
+    materialization: "relative-symlink",
+    name: candidate.targetName,
+    repository: candidate.repository.id,
+    source: candidate.source,
+    sourceCommit: candidate.sourceCommit,
+    treeOid: candidate.treeOid,
+  };
+}
+
+function resolveSkillLinks(
+  resolvedRoot: string,
+  manifest: CoordinatorManifest,
+): ResolvedSkillLink[] {
+  return resolveCandidates(resolvedRoot, manifest).map((candidate) => ({
+    candidate,
+    skill: linkedSkill(resolvedRoot, candidate),
+  }));
+}
+
+function sourcePlanSignature(links: ResolvedSkillLink[]): string {
+  return JSON.stringify(
+    links.map(({ candidate, skill }) => ({
+      skill,
+      sourceDirectory: candidate.sourceDirectory,
+    })),
+  );
+}
+
+function managedDestinationChanged(name: string): CoordinatorError {
+  return new CoordinatorError(
+    `Managed skill destination '.agents/skills/${name}' no longer matches its lockfile state. Preserve it or preview adoption with 'coordinator agents check --force' before running 'coordinator agents sync --force'.`,
+    "SKILL_MANAGED_DESTINATION_CHANGED",
+  );
+}
+
+function createDirectoryIfMissing(directory: string, label: string): void {
+  try {
+    mkdirSync(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const status = lstatSync(directory);
+  if (!status.isDirectory() || status.isSymbolicLink()) {
+    throw new CoordinatorError(
+      `${label} is not a safe directory: ${directory}.`,
+      "SKILL_DESTINATION_INVALID",
+    );
+  }
+}
+
+function ensureSkillRegistry(root: string): DirectoryIdentity {
+  const agentsRoot = safeGeneratedPath(root, ".agents");
+  createDirectoryIfMissing(agentsRoot, "Agent registry");
+  const agentsStatus = lstatSync(agentsRoot);
+  const agentsIdentity = {
+    dev: Number(agentsStatus.dev),
+    ino: Number(agentsStatus.ino),
+  };
+  assertDirectoryIdentity(agentsRoot, agentsIdentity);
+
+  const skillsRoot = path.join(agentsRoot, "skills");
+  createDirectoryIfMissing(skillsRoot, "Skill registry");
+  assertDirectoryIdentity(agentsRoot, agentsIdentity);
+  safeGeneratedPath(root, ".agents/skills");
+  const skillsStatus = lstatSync(skillsRoot);
+  const skillsIdentity = {
+    dev: Number(skillsStatus.dev),
+    ino: Number(skillsStatus.ino),
+  };
+  assertDirectoryIdentity(skillsRoot, skillsIdentity);
+  return skillsIdentity;
+}
+
+function createSkillLink(
+  linkTarget: string,
+  destination: string,
+  name: string,
+): void {
+  try {
+    symlinkSync(linkTarget, destination, "dir");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new CoordinatorError(
+        `Skill destination '.agents/skills/${name}' changed during publication.`,
+        "SKILL_DESTINATION_CHANGED",
+      );
+    }
+    throw new CoordinatorError(
+      `Could not create relative source link for skill '${name}': ${error instanceof Error ? error.message : String(error)}. Ensure this filesystem and account permit symbolic links.`,
+      "SKILL_SYMLINK_UNAVAILABLE",
+    );
+  }
+}
+
 export function synchronizeSkills(
   root: string,
   manifest: CoordinatorManifest,
   generatorVersion: string,
-  options: { check?: boolean | undefined; force?: boolean | undefined } = {},
+  options: {
+    check?: boolean | undefined;
+    dependentFilePlans?: FilePlan[] | undefined;
+    expectedSkills?: MaterializedSkill[] | undefined;
+    force?: boolean | undefined;
+  } = {},
 ): SkillSyncResult {
   const resolvedRoot = path.resolve(root);
   const skillsRoot = safeGeneratedPath(resolvedRoot, ".agents/skills");
@@ -684,140 +1052,253 @@ export function synchronizeSkills(
       "UNMANAGED_FILE",
     );
   }
-  const previouslyManaged = new Set(
-    previousLock?.skills.map((skill) => skill.name) ?? [],
+  const legacyByName = new Map<string, LegacyMaterializedSkill>(
+    previousLock?.schemaVersion === 1
+      ? previousLock.skills.map((skill) => [skill.name, skill])
+      : [],
   );
-  const candidates = resolveCandidates(root, manifest);
-  if (existsSync(skillsRoot) && !lstatSync(skillsRoot).isDirectory()) {
+  const linkedByName = new Map<string, MaterializedSkill>(
+    previousLock?.schemaVersion === 2
+      ? previousLock.skills.map((skill) => [skill.name, skill])
+      : [],
+  );
+  const previouslyManaged = new Set([
+    ...legacyByName.keys(),
+    ...linkedByName.keys(),
+  ]);
+  const links = resolveSkillLinks(resolvedRoot, manifest);
+  const skills = links.map(({ skill }) => skill);
+  if (
+    options.expectedSkills &&
+    JSON.stringify(skills) !== JSON.stringify(options.expectedSkills)
+  ) {
+    throw new CoordinatorError(
+      "Skill sources changed after dependent agent files were planned. Run synchronization again.",
+      "SKILL_PLAN_STALE",
+    );
+  }
+  const skillsRootStatus = lstatIfPresent(skillsRoot);
+  if (skillsRootStatus && !skillsRootStatus.isDirectory()) {
     throw new CoordinatorError(
       `Skill registry is not a directory: ${skillsRoot}.`,
       "SKILL_DESTINATION_INVALID",
     );
   }
-  if (!options.check) {
-    mkdirSync(skillsRoot, { recursive: true });
-    safeGeneratedPath(resolvedRoot, ".agents/skills");
+  const desired = new Set(skills.map((skill) => skill.name));
+  const mutations: PlannedSkillMutation[] = [];
+  const migrations: string[] = [];
+  const force = options.force ?? false;
+
+  for (const skill of skills) {
+    const target = validateTarget(resolvedRoot, skill.name);
+    const snapshot = destinationSnapshot(target);
+    const legacy = legacyByName.get(skill.name);
+    const linked = linkedByName.get(skill.name);
+    let action: SkillLinkActionKind | null = null;
+    if (snapshot.kind === "missing") {
+      action = "create-link";
+    } else if (legacy) {
+      if (
+        snapshot.kind === "directory" &&
+        snapshot.digest === legacy.digest
+      ) {
+        action = "migrate-copy";
+        migrations.push(
+          `${skill.name}: managed copy -> relative source symlink`,
+        );
+      } else if (
+        snapshot.kind === "symlink" &&
+        snapshot.linkTarget === skill.linkTarget
+      ) {
+        action = "adopt-link";
+      } else if (!force) {
+        throw new CoordinatorError(
+          `Managed skill copy '.agents/skills/${skill.name}' was modified or replaced and cannot be migrated safely. Preview forced adoption with 'coordinator agents check --force'.`,
+          "SKILL_MANAGED_COPY_MODIFIED",
+        );
+      } else {
+        action = "replace-link";
+      }
+    } else if (linked) {
+      if (
+        snapshot.kind === "symlink" &&
+        snapshot.linkTarget === skill.linkTarget
+      ) {
+        action = null;
+      } else if (snapshot.kind === "symlink") {
+        action = "replace-link";
+      } else if (!force) {
+        throw managedDestinationChanged(skill.name);
+      } else {
+        action = "replace-link";
+      }
+    } else if (!force) {
+      throw new CoordinatorError(
+        `Refusing to replace unmanaged skill '.agents/skills/${skill.name}'. Preview adoption with 'coordinator agents check --force'.`,
+        "UNMANAGED_SKILL",
+      );
+    } else if (
+      snapshot.kind === "symlink" &&
+      snapshot.linkTarget === skill.linkTarget
+    ) {
+      action = "adopt-link";
+    } else {
+      action = "replace-link";
+    }
+    if (action) {
+      mutations.push({
+        action: { action, linkTarget: skill.linkTarget, name: skill.name },
+        desired: skill,
+        expected: snapshot,
+        target,
+      });
+    }
   }
-  const temporaryRoot = mkdtempSync(
-    options.check
-      ? path.join(os.tmpdir(), "agent-coordinator-skills-")
-      : path.join(skillsRoot, ".coordinator-staging-"),
+
+  for (const oldName of previouslyManaged) {
+    if (desired.has(oldName)) continue;
+    const target = validateTarget(resolvedRoot, oldName);
+    const snapshot = destinationSnapshot(target);
+    if (snapshot.kind === "missing") continue;
+    const legacy = legacyByName.get(oldName);
+    const linked = linkedByName.get(oldName);
+    const intact = legacy
+      ? snapshot.kind === "directory" && snapshot.digest === legacy.digest
+      : linked
+        ? snapshot.kind === "symlink" &&
+          snapshot.linkTarget === linked.linkTarget
+        : false;
+    if (!intact && !force) throw managedDestinationChanged(oldName);
+    mutations.push({
+      action: { action: "delete-managed", linkTarget: null, name: oldName },
+      desired: null,
+      expected: snapshot,
+      target,
+    });
+  }
+
+  const nextLock: AgentSkillLock = {
+    schemaVersion: 2,
+    generatedBy: "agent-coordinator",
+    generatorVersion,
+    skills,
+  };
+  const renderedLock = `${JSON.stringify(nextLock, null, 2)}\n`;
+  const lockPlan = planFile(
+    resolvedRoot,
+    ".coordinator/agents.lock.json",
+    renderedLock,
+    {
+      force,
+      owned: (content) => parseLock(content) !== null,
+    },
   );
+  const actions = mutations.map(({ action }) => action);
+  const changed = actions.length > 0 || lockPlan.action !== "unchanged";
+  const result = {
+    actions,
+    changed,
+    migrations,
+    names: skills.map((skill) => skill.name),
+    skills,
+  };
+  if (options.check) return result;
+
+  const skillsRootIdentity = ensureSkillRegistry(resolvedRoot);
+  const refreshedLinks = resolveSkillLinks(resolvedRoot, manifest);
+  if (sourcePlanSignature(refreshedLinks) !== sourcePlanSignature(links)) {
+    throw new CoordinatorError(
+      "Skill sources changed after planning; run synchronization again.",
+      "SKILL_SOURCE_CHANGED",
+    );
+  }
+  for (const mutation of mutations) {
+    if (!snapshotsMatch(destinationSnapshot(mutation.target), mutation.expected)) {
+      throw new CoordinatorError(
+        `Skill destination '.agents/skills/${mutation.action.name}' changed after planning.`,
+        "SKILL_DESTINATION_CHANGED",
+      );
+    }
+  }
+
+  const temporaryRoot = mkdtempSync(
+    path.join(skillsRoot, ".coordinator-staging-"),
+  );
+  let preserveTemporaryRoot = false;
   try {
-    const stagedRoot = path.join(temporaryRoot, "staged");
     const backupRoot = path.join(temporaryRoot, "backup");
     const discardedRoot = path.join(temporaryRoot, "discarded");
-    mkdirSync(stagedRoot, { recursive: true });
-    mkdirSync(backupRoot, { recursive: true });
-    mkdirSync(discardedRoot, { recursive: true });
-    const skills = candidates.map((candidate): MaterializedSkill => {
-      const destination = path.join(stagedRoot, candidate.targetName);
-      archiveCandidate(candidate, destination);
-      return {
-        name: candidate.targetName,
-        repository: candidate.repository.id,
-        source: candidate.source,
-        sourceCommit: candidate.sourceCommit,
-        treeOid: candidate.treeOid,
-        digest: directoryDigest(destination),
-      };
-    });
-    const desired = new Set(skills.map((skill) => skill.name));
-    const replacements = new Set<string>();
-    let changed = previousLock?.generatorVersion !== generatorVersion;
-
-    for (const skill of skills) {
-      const target = validateTarget(resolvedRoot, skill.name);
-      if (!existsSync(target)) {
-        changed = true;
-        replacements.add(skill.name);
-        continue;
-      }
-      if (!lstatSync(target).isDirectory()) {
-        throw new CoordinatorError(`Skill destination is not a directory: ${target}`);
-      }
-      if (!previouslyManaged.has(skill.name) && !options.force) {
-        throw new CoordinatorError(
-          `Refusing to replace unmanaged skill '.agents/skills/${skill.name}'.`,
-          "UNMANAGED_SKILL",
-        );
-      }
-      if (directoryDigest(target) !== skill.digest) {
-        changed = true;
-        replacements.add(skill.name);
-      }
-    }
-    for (const oldName of previouslyManaged) {
-      if (!desired.has(oldName)) changed = true;
-    }
-
-    const nextLock: AgentSkillLock = {
-      schemaVersion: 1,
-      generatedBy: "agent-coordinator",
-      generatorVersion,
-      skills,
-    };
-    const renderedLock = `${JSON.stringify(nextLock, null, 2)}\n`;
-    const lockPlan = planFile(
-      resolvedRoot,
-      ".coordinator/agents.lock.json",
-      renderedLock,
-      {
-        force: options.force,
-        owned: (content) => parseLock(content) !== null,
-      },
-    );
-    if (lockPlan.action !== "unchanged") changed = true;
-
-    if (options.check) {
-      return { changed, names: skills.map((skill) => skill.name), skills };
-    }
-
-    const skillsRootStatus = lstatSync(skillsRoot);
-    const skillsRootIdentity = {
-      dev: skillsRootStatus.dev,
-      ino: skillsRootStatus.ino,
-    };
-    assertDirectoryIdentity(skillsRoot, skillsRootIdentity);
+    mkdirSync(backupRoot);
+    mkdirSync(discardedRoot);
     const applied: PublishedSkillChange[] = [];
     try {
-      for (const oldName of previouslyManaged) {
-        if (desired.has(oldName)) continue;
+      for (const mutation of mutations) {
         assertDirectoryIdentity(skillsRoot, skillsRootIdentity);
-        const target = validateTarget(resolvedRoot, oldName);
-        if (!existsSync(target)) continue;
-        const change: PublishedSkillChange = {
-          backup: path.join(backupRoot, oldName),
-          name: oldName,
-          published: false,
-          target,
-        };
-        applied.push(change);
-        renameSync(target, change.backup!);
-      }
-      for (const skill of skills) {
-        if (!replacements.has(skill.name)) continue;
-        assertDirectoryIdentity(skillsRoot, skillsRootIdentity);
-        const target = validateTarget(resolvedRoot, skill.name);
+        if (
+          !snapshotsMatch(
+            destinationSnapshot(mutation.target),
+            mutation.expected,
+          )
+        ) {
+          throw new CoordinatorError(
+            `Skill destination '.agents/skills/${mutation.action.name}' changed during publication.`,
+            "SKILL_DESTINATION_CHANGED",
+          );
+        }
+        if (mutation.action.action === "adopt-link") continue;
         const change: PublishedSkillChange = {
           backup: null,
-          name: skill.name,
+          name: mutation.action.name,
           published: false,
-          target,
+          publishedSnapshot: null,
+          target: mutation.target,
         };
         applied.push(change);
-        if (existsSync(target)) {
-          const backup = path.join(backupRoot, skill.name);
-          change.backup = backup;
-          renameSync(target, backup);
+        if (lstatIfPresent(mutation.target)) {
+          change.backup = path.join(backupRoot, mutation.action.name);
+          renameSync(mutation.target, change.backup);
+          if (
+            !snapshotsMatch(
+              destinationSnapshot(change.backup),
+              mutation.expected,
+            )
+          ) {
+            throw new CoordinatorError(
+              `Skill destination '.agents/skills/${mutation.action.name}' changed while it was being backed up.`,
+              "SKILL_DESTINATION_CHANGED",
+            );
+          }
         }
-        assertDirectoryIdentity(skillsRoot, skillsRootIdentity);
-        validateTarget(resolvedRoot, skill.name);
-        renameSync(path.join(stagedRoot, skill.name), target);
-        change.published = true;
+        if (mutation.desired) {
+          assertDirectoryIdentity(skillsRoot, skillsRootIdentity);
+          createSkillLink(
+            mutation.desired.linkTarget,
+            mutation.target,
+            mutation.action.name,
+          );
+          const publishedSnapshot = destinationSnapshot(mutation.target);
+          if (
+            publishedSnapshot.kind !== "symlink" ||
+            publishedSnapshot.linkTarget !== mutation.desired.linkTarget
+          ) {
+            throw new CoordinatorError(
+              `Published skill link '${mutation.action.name}' does not match its plan.`,
+              "SKILL_DESTINATION_CHANGED",
+            );
+          }
+          change.published = true;
+          change.publishedSnapshot = publishedSnapshot;
+        }
       }
       assertDirectoryIdentity(skillsRoot, skillsRootIdentity);
-      applyFilePlans([lockPlan]);
+      const finalLinks = resolveSkillLinks(resolvedRoot, manifest);
+      if (sourcePlanSignature(finalLinks) !== sourcePlanSignature(links)) {
+        throw new CoordinatorError(
+          "Skill sources changed during publication.",
+          "SKILL_SOURCE_CHANGED",
+        );
+      }
+      applyFilePlans([lockPlan, ...(options.dependentFilePlans ?? [])]);
     } catch (error) {
       const rollbackFailures = rollbackSkillChanges(
         resolvedRoot,
@@ -827,38 +1308,81 @@ export function synchronizeSkills(
         applied,
       );
       if (rollbackFailures.length) {
+        preserveTemporaryRoot = true;
         throw new CoordinatorError(
-          `Skill synchronization failed (${error instanceof Error ? error.message : String(error)}) and rollback was incomplete: ${rollbackFailures.join("; ")}.`,
+          `Skill synchronization failed (${error instanceof Error ? error.message : String(error)}) and rollback was incomplete: ${rollbackFailures.join("; ")}. Recovery data was preserved at ${temporaryRoot}.`,
           "SKILL_ROLLBACK_FAILED",
         );
       }
       throw error;
     }
-    return { changed, names: skills.map((skill) => skill.name), skills };
+    return result;
   } finally {
-    if (existsSync(temporaryRoot)) rmSync(temporaryRoot, { recursive: true });
+    if (!preserveTemporaryRoot && lstatIfPresent(temporaryRoot)) {
+      rmSync(temporaryRoot, { recursive: true });
+    }
   }
 }
 
-export function discoverSkillSources(repositoryDirectory: string): string[] {
-  const results: string[] = [];
-  const visit = (directory: string, depth: number) => {
+export function discoverSkillSources(
+  repositoryDirectory: string,
+): DiscoveredSkillSource[] {
+  const results = new Map<string, DiscoveredSkillSource>();
+  let repositoryRealPath: string;
+  try {
+    repositoryRealPath = realpathSync(repositoryDirectory);
+  } catch {
+    return [];
+  }
+  const visit = (
+    directory: string,
+    exportedDirectory: string,
+    depth: number,
+    ancestors: Set<string>,
+  ) => {
     if (depth > 9) return;
+    let directoryRealPath: string;
+    try {
+      directoryRealPath = realpathSync(directory);
+    } catch {
+      return;
+    }
+    if (!isWithin(repositoryRealPath, directoryRealPath)) return;
+    if (ancestors.has(directoryRealPath)) return;
+    const nextAncestors = new Set(ancestors).add(directoryRealPath);
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       if ([".git", "node_modules", "dist", "build"].includes(entry.name)) continue;
       const absolute = path.join(directory, entry.name);
-      if (!entry.isDirectory()) continue;
-      const relative = path.relative(repositoryDirectory, absolute);
-      if (
-        existsSync(path.join(absolute, "SKILL.md")) &&
-        /(^|\/)\.agents\/(skills|flows)\/[a-z0-9-]+$/.test(relative)
-      ) {
-        results.push(relative);
+      let candidateRealPath: string;
+      try {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        candidateRealPath = realpathSync(absolute);
+        if (!statSync(candidateRealPath).isDirectory()) continue;
+      } catch {
         continue;
       }
-      visit(absolute, depth + 1);
+      if (!isWithin(repositoryRealPath, candidateRealPath)) continue;
+      const relative = gitPath(path.relative(repositoryRealPath, candidateRealPath));
+      const exported = gitPath(path.join(exportedDirectory, entry.name));
+      const exportMatch =
+        /(^|\/)\.agents\/(skills|flows)\/[a-z0-9-]+$/.exec(exported);
+      if (
+        relative &&
+        existsSync(path.join(candidateRealPath, "SKILL.md")) &&
+        exportMatch
+      ) {
+        const kind = exportMatch[2] === "flows" ? "flow" : "skill";
+        results.set(`${kind}\0${relative}`, { source: relative, kind });
+        continue;
+      }
+      visit(candidateRealPath, exported, depth + 1, nextAncestors);
     }
   };
-  if (existsSync(repositoryDirectory)) visit(repositoryDirectory, 0);
-  return results.sort();
+  if (existsSync(repositoryDirectory)) {
+    visit(repositoryRealPath, "", 0, new Set());
+  }
+  return [...results.values()].sort(
+    (left, right) =>
+      left.source.localeCompare(right.source) || left.kind.localeCompare(right.kind),
+  );
 }

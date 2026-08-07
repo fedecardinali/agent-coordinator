@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
+  renameSync,
   rmSync,
-  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { loadManifest } from "../src/core/manifest.js";
 import { coordinatorManifestSchema } from "../src/core/schema.js";
+import { runDoctor } from "../src/doctor/check.js";
 import {
   installMachineGitRuntime,
   installWorkspaceGitIntegration,
@@ -19,7 +23,68 @@ import {
 import { initializeWorkspace } from "../src/workspace/initialize.js";
 import { synchronizeWorkspace } from "../src/workspace/sync.js";
 import { migrateLegacyWorkspace } from "../src/workspace/migrate.js";
-import { createChildRemote, git, temporaryDirectory } from "./helpers.js";
+import {
+  createChildRemote,
+  createNestedAgentRemote,
+  git,
+  temporaryDirectory,
+} from "./helpers.js";
+
+interface SkillLockEntryV2 {
+  linkTarget: string;
+  materialization: "relative-symlink";
+  name: string;
+  repository: string;
+  source: string;
+  sourceCommit: string;
+  treeOid: string;
+}
+
+interface SkillLockV2 {
+  generatedBy: "agent-coordinator";
+  generatorVersion: string;
+  schemaVersion: 2;
+  skills: SkillLockEntryV2[];
+}
+
+function expectedSkillLinkTarget(sourceWorkspacePath: string): string {
+  return path.posix.relative(
+    ".agents/skills",
+    sourceWorkspacePath.split(path.sep).join("/"),
+  );
+}
+
+function assertRelativeSkillLink(
+  root: string,
+  name: string,
+  sourceWorkspacePath: string,
+): string {
+  const destination = path.join(root, ".agents", "skills", name);
+  assert.equal(lstatSync(destination).isSymbolicLink(), true);
+  const linkTarget = readlinkSync(destination);
+  assert.equal(path.isAbsolute(linkTarget), false);
+  assert.equal(linkTarget, expectedSkillLinkTarget(sourceWorkspacePath));
+  assert.equal(
+    path.resolve(path.dirname(destination), linkTarget),
+    path.resolve(root, sourceWorkspacePath),
+  );
+  return linkTarget;
+}
+
+function readSkillLock(root: string): SkillLockV2 {
+  const lock = JSON.parse(
+    readFileSync(path.join(root, ".coordinator", "agents.lock.json"), "utf8"),
+  ) as SkillLockV2;
+  assert.equal(lock.schemaVersion, 2);
+  assert.equal(lock.generatedBy, "agent-coordinator");
+  for (const skill of lock.skills) {
+    assert.equal(skill.materialization, "relative-symlink");
+    assert.equal(path.isAbsolute(skill.linkTarget), false);
+    assert.match(skill.sourceCommit, /^[0-9a-f]{40,64}$/);
+    assert.match(skill.treeOid, /^[0-9a-f]{40,64}$/);
+  }
+  return lock;
+}
 
 function withEnvironment<T>(
   values: Record<string, string | undefined>,
@@ -42,7 +107,7 @@ function withEnvironment<T>(
   }
 }
 
-test("init creates a Git-compatible workspace and materializes committed skills", (context) => {
+test("init creates a Git-compatible workspace and links committed skills", (context) => {
   const temporary = temporaryDirectory();
   context.after(() => rmSync(temporary, { recursive: true }));
   const backend = createChildRemote(temporary, "backend", "api-testing");
@@ -88,14 +153,51 @@ test("init creates a Git-compatible workspace and materializes committed skills"
   assert.ok(existsSync(path.join(root, ".claude", "agents", "frontend.md")));
   assert.ok(existsSync(path.join(root, ".agents", "skills", "api-testing", "SKILL.md")));
   assert.ok(existsSync(path.join(root, ".agents", "skills", "ui-testing", "SKILL.md")));
+  const apiLinkTarget = assertRelativeSkillLink(
+    root,
+    "api-testing",
+    "backend/.agents/skills/api-testing",
+  );
+  const uiLinkTarget = assertRelativeSkillLink(
+    root,
+    "ui-testing",
+    "frontend/.agents/skills/ui-testing",
+  );
+  const lock = readSkillLock(root);
+  assert.deepEqual(
+    lock.skills.map(({ linkTarget, materialization, name, repository, source }) => ({
+      linkTarget,
+      materialization,
+      name,
+      repository,
+      source,
+    })),
+    [
+      {
+        linkTarget: apiLinkTarget,
+        materialization: "relative-symlink",
+        name: "api-testing",
+        repository: "backend",
+        source: ".agents/skills/api-testing",
+      },
+      {
+        linkTarget: uiLinkTarget,
+        materialization: "relative-symlink",
+        name: "ui-testing",
+        repository: "frontend",
+        source: ".agents/skills/ui-testing",
+      },
+    ],
+  );
   const loaded = loadManifest(root);
   assert.equal(loaded.manifest.repositories[0]!.agent.skills.length, 1);
   const check = synchronizeWorkspace(root, loaded.manifest, "0.1.0", { check: true });
   assert.equal(check.changed, false);
-  const skillPath = path.join(root, ".agents", "skills", "api-testing", "SKILL.md");
-  const skillInode = statSync(skillPath).ino;
+  const skillPath = path.join(root, ".agents", "skills", "api-testing");
+  const skillInode = lstatSync(skillPath).ino;
   assert.equal(synchronizeWorkspace(root, loaded.manifest, "0.1.0").changed, false);
-  assert.equal(statSync(skillPath).ino, skillInode);
+  assert.equal(lstatSync(skillPath).ino, skillInode);
+  assert.equal(readlinkSync(skillPath), apiLinkTarget);
 
   git(root, "add", ".");
   git(root, "commit", "-m", "Initialize coordinated workspace");
@@ -116,6 +218,441 @@ test("init creates a Git-compatible workspace and materializes committed skills"
       assert.match(invariant.stdout, /invariant OK/);
     },
   );
+});
+
+test("init recursively materializes nested agent runtimes using the Market Intel preset", (context) => {
+  const temporary = temporaryDirectory("agent-coordinator-nested-init-");
+  context.after(() => rmSync(temporary, { recursive: true }));
+  const backend = createNestedAgentRemote(temporary, "backend");
+  const frontend = createNestedAgentRemote(temporary, "frontend");
+  const root = path.join(temporary, "test-space");
+  const input = coordinatorManifestSchema.parse({
+    schemaVersion: 2,
+    name: "test-space",
+    remote: "origin",
+    repositories: [
+      {
+        id: "backend",
+        path: "market-intel-back-end",
+        url: backend.remote,
+        branch: { mode: "mirror", readOnly: false },
+        agent: { instructions: [], verify: [], skills: [] },
+      },
+      {
+        id: "frontend",
+        path: "market-intel-front-end",
+        url: frontend.remote,
+        branch: { mode: "mirror", readOnly: false },
+        agent: { instructions: [], verify: [], skills: [] },
+      },
+    ],
+    agents: {
+      tools: ["codex"],
+      maxParallel: 2,
+      skillCollision: "namespace",
+    },
+  });
+
+  initializeWorkspace(root, input, "0.3.0", {
+    discoverSkills: true,
+    installHooks: false,
+  });
+
+  const recursiveStatus = git(root, "submodule", "status", "--recursive");
+  assert.doesNotMatch(recursiveStatus, /^-/m);
+  assert.equal(
+    git(path.join(root, "market-intel-back-end"), "branch", "--show-current"),
+    "main",
+  );
+  assert.equal(
+    git(path.join(root, "market-intel-front-end"), "branch", "--show-current"),
+    "main",
+  );
+  assert.match(
+    readFileSync(path.join(root, "market-intel-back-end", "AGENTS.md"), "utf8"),
+    /backend runtime/,
+  );
+  assert.match(
+    readFileSync(path.join(root, "market-intel-front-end", "AGENTS.md"), "utf8"),
+    /frontend runtime/,
+  );
+
+  const loaded = loadManifest(root);
+  assert.deepEqual(
+    loaded.manifest.repositories.map((repository) => repository.agent.skills),
+    [backend, frontend].map((fixture) => [
+      {
+        kind: "flow",
+        source: `${fixture.runtimePath}/.agents/flows/${fixture.flowName}`,
+      },
+      {
+        kind: "skill",
+        source: `${fixture.runtimePath}/.agents/skills/${fixture.skillName}`,
+      },
+      {
+        kind: "flow",
+        source: `${fixture.runtimePath}/${fixture.vendorPath}/flows/${fixture.aliasFlowName}`,
+      },
+      {
+        kind: "skill",
+        source: `${fixture.runtimePath}/${fixture.vendorPath}/skills/${fixture.aliasName}`,
+      },
+    ]),
+  );
+  const linkedSkills = [backend, frontend].flatMap((fixture, index) => {
+    const repositoryPath = loaded.manifest.repositories[index]!.path;
+    return [
+      {
+        name: fixture.flowName,
+        source: `${repositoryPath}/${fixture.runtimePath}/.agents/flows/${fixture.flowName}`,
+      },
+      {
+        name: fixture.skillName,
+        source: `${repositoryPath}/${fixture.runtimePath}/.agents/skills/${fixture.skillName}`,
+      },
+      {
+        name: fixture.aliasFlowName,
+        source: `${repositoryPath}/${fixture.runtimePath}/${fixture.vendorPath}/flows/${fixture.aliasFlowName}`,
+      },
+      {
+        name: fixture.aliasName,
+        source: `${repositoryPath}/${fixture.runtimePath}/${fixture.vendorPath}/skills/${fixture.aliasName}`,
+      },
+    ];
+  });
+  const expectedTargets = new Map<string, string>();
+  for (const skill of linkedSkills) {
+    assert.ok(
+      existsSync(path.join(root, ".agents", "skills", skill.name, "SKILL.md")),
+    );
+    expectedTargets.set(
+      skill.name,
+      assertRelativeSkillLink(root, skill.name, skill.source),
+    );
+  }
+  const nestedLock = readSkillLock(root);
+  assert.deepEqual(
+    nestedLock.skills.map((skill) => skill.name),
+    [...expectedTargets.keys()].sort(),
+  );
+  for (const skill of nestedLock.skills) {
+    assert.equal(skill.linkTarget, expectedTargets.get(skill.name));
+  }
+  assert.equal(
+    synchronizeWorkspace(root, loaded.manifest, "0.3.0", { check: true }).changed,
+    false,
+  );
+
+  git(root, "add", ".");
+  git(root, "commit", "-m", "Initialize nested coordinator");
+  const doctor = runDoctor(root, loaded.manifest, "0.3.0");
+  assert.equal(
+    doctor.checks.find((item) => item.label === "Gitlinks")?.status,
+    "pass",
+  );
+  assert.equal(
+    doctor.checks.find((item) => item.label === "Generated outputs")?.status,
+    "pass",
+  );
+});
+
+test("init repairs adopted repositories whose nested runtimes are uninitialized", (context) => {
+  const temporary = temporaryDirectory("agent-coordinator-nested-recovery-");
+  context.after(() => rmSync(temporary, { recursive: true }));
+  const backend = createNestedAgentRemote(temporary, "backend");
+  const root = path.join(temporary, "test-space");
+  mkdirSync(root, { recursive: true });
+  git(root, "init", "--initial-branch=main");
+  git(
+    root,
+    "submodule",
+    "add",
+    "--name",
+    "backend",
+    backend.remote,
+    "market-intel-back-end",
+  );
+  assert.match(
+    git(root, "submodule", "status", "--recursive"),
+    /^-[0-9a-f]+ market-intel-back-end\/.agent-runtime\/backend-agent/m,
+  );
+
+  const input = coordinatorManifestSchema.parse({
+    schemaVersion: 2,
+    name: "test-space",
+    remote: "origin",
+    repositories: [
+      {
+        id: "backend",
+        path: "market-intel-back-end",
+        url: backend.remote,
+        branch: { mode: "mirror", readOnly: false },
+        agent: { instructions: [], verify: [], skills: [] },
+      },
+    ],
+    agents: {
+      tools: ["codex"],
+      maxParallel: 1,
+      skillCollision: "namespace",
+    },
+  });
+  initializeWorkspace(root, input, "0.3.0", {
+    discoverSkills: true,
+    installHooks: false,
+  });
+
+  assert.doesNotMatch(git(root, "submodule", "status", "--recursive"), /^-/m);
+  assert.match(
+    readFileSync(path.join(root, "market-intel-back-end", "AGENTS.md"), "utf8"),
+    /backend runtime/,
+  );
+  const loaded = loadManifest(root);
+  assert.equal(loaded.manifest.repositories[0]!.agent.skills.length, 4);
+  assert.ok(
+    existsSync(
+      path.join(root, ".agents", "skills", backend.aliasName, "SKILL.md"),
+    ),
+  );
+});
+
+test("reinitialization never moves an existing nested checkout", (context) => {
+  const temporary = temporaryDirectory("agent-coordinator-nested-preserve-");
+  context.after(() => rmSync(temporary, { recursive: true }));
+  const backend = createNestedAgentRemote(temporary, "backend");
+  const root = path.join(temporary, "test-space");
+  const input = coordinatorManifestSchema.parse({
+    schemaVersion: 2,
+    name: "test-space",
+    repositories: [
+      {
+        id: "backend",
+        path: "market-intel-back-end",
+        url: backend.remote,
+        agent: { instructions: [], verify: [], skills: [] },
+      },
+    ],
+    agents: {
+      tools: ["codex"],
+      maxParallel: 1,
+      skillCollision: "namespace",
+    },
+  });
+  initializeWorkspace(root, input, "0.3.0", {
+    discoverSkills: true,
+    installHooks: false,
+  });
+  const loaded = loadManifest(root);
+  const runtime = path.join(
+    root,
+    "market-intel-back-end",
+    backend.runtimePath,
+  );
+  git(runtime, "switch", "-c", "work");
+  writeFileSync(path.join(runtime, "local-work.txt"), "preserve me\n");
+  git(runtime, "add", ".");
+  git(runtime, "commit", "-m", "Local runtime work");
+  const localCommit = git(runtime, "rev-parse", "HEAD");
+
+  assert.throws(
+    () =>
+      initializeWorkspace(root, loaded.manifest, "0.3.0", {
+        discoverSkills: true,
+        installHooks: false,
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "code" in error);
+      assert.equal(error.code, "NESTED_SUBMODULE_GITLINK_MISMATCH");
+      assert.match(error.message, /will not move an existing checkout/);
+      return true;
+    },
+  );
+  assert.equal(git(runtime, "branch", "--show-current"), "work");
+  assert.equal(git(runtime, "rev-parse", "HEAD"), localCommit);
+});
+
+test("reinitialization rejects a nested checkout symlink outside its parent", (context) => {
+  const temporary = temporaryDirectory("agent-coordinator-nested-escape-");
+  context.after(() => rmSync(temporary, { recursive: true }));
+  const backend = createNestedAgentRemote(temporary, "backend");
+  const root = path.join(temporary, "test-space");
+  const input = coordinatorManifestSchema.parse({
+    schemaVersion: 2,
+    name: "test-space",
+    repositories: [
+      {
+        id: "backend",
+        path: "market-intel-back-end",
+        url: backend.remote,
+        agent: { instructions: [], verify: [], skills: [] },
+      },
+    ],
+    agents: {
+      tools: ["codex"],
+      maxParallel: 1,
+      skillCollision: "namespace",
+    },
+  });
+  initializeWorkspace(root, input, "0.3.0", {
+    discoverSkills: true,
+    installHooks: false,
+  });
+  const loaded = loadManifest(root);
+  const runtime = path.join(
+    root,
+    "market-intel-back-end",
+    backend.runtimePath,
+  );
+  const external = path.join(temporary, "external-runtime");
+  git(temporary, "clone", backend.runtimeRemote, external);
+  const externalStatus = git(external, "submodule", "status", "--recursive");
+  assert.match(externalStatus, /^-/m);
+  rmSync(runtime, { recursive: true });
+  symlinkSync(external, runtime, "dir");
+
+  assert.throws(
+    () =>
+      initializeWorkspace(root, loaded.manifest, "0.3.0", {
+        discoverSkills: true,
+        installHooks: false,
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "code" in error);
+      assert.equal(error.code, "NESTED_SUBMODULE_PATH_INVALID");
+      assert.match(error.message, /crosses symbolic link/);
+      return true;
+    },
+  );
+  assert.equal(
+    git(external, "submodule", "status", "--recursive"),
+    externalStatus,
+  );
+});
+
+test("init rejects a direct repository symlink without touching its target", (context) => {
+  const temporary = temporaryDirectory("agent-coordinator-direct-escape-");
+  context.after(() => rmSync(temporary, { recursive: true }));
+  const backend = createNestedAgentRemote(temporary, "backend");
+  const root = path.join(temporary, "test-space");
+  mkdirSync(root, { recursive: true });
+  git(root, "init", "--initial-branch=main");
+  const repositoryPath = "market-intel-back-end";
+  git(
+    root,
+    "submodule",
+    "add",
+    "--name",
+    "backend",
+    backend.remote,
+    repositoryPath,
+  );
+  const checkout = path.join(root, repositoryPath);
+  const external = path.join(temporary, "external-backend");
+  git(temporary, "clone", backend.remote, external);
+  const externalStatus = git(external, "submodule", "status", "--recursive");
+  assert.match(externalStatus, /^-/m);
+  rmSync(checkout, { recursive: true });
+  symlinkSync(external, checkout, "dir");
+  const input = coordinatorManifestSchema.parse({
+    schemaVersion: 2,
+    name: "test-space",
+    repositories: [
+      {
+        id: "backend",
+        path: repositoryPath,
+        url: backend.remote,
+        agent: { instructions: [], verify: [], skills: [] },
+      },
+    ],
+    agents: {
+      tools: ["codex"],
+      maxParallel: 1,
+      skillCollision: "namespace",
+    },
+  });
+  const previousDirectory = process.cwd();
+  try {
+    process.chdir(root);
+    assert.throws(
+      () =>
+        initializeWorkspace(root, input, "0.3.0", {
+          discoverSkills: true,
+          installHooks: false,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error && "code" in error);
+        assert.equal(error.code, "EXISTING_PATH_NOT_DECLARED_SUBMODULE");
+        assert.match(error.message, /crosses symbolic link/);
+        return true;
+      },
+    );
+  } finally {
+    process.chdir(previousDirectory);
+  }
+  assert.equal(
+    git(external, "submodule", "status", "--recursive"),
+    externalStatus,
+  );
+  assert.equal(existsSync(path.join(root, "coordinator.yaml")), false);
+});
+
+test("init reports a nested checkout failure before generating an empty skill set", (context) => {
+  const temporary = temporaryDirectory("agent-coordinator-nested-failure-");
+  context.after(() => rmSync(temporary, { recursive: true }));
+  const backend = createNestedAgentRemote(temporary, "backend");
+  const completeRuntime = `${backend.runtimeRemote}.complete`;
+  renameSync(backend.runtimeRemote, completeRuntime);
+  const incompleteSource = path.join(temporary, "incomplete-runtime-source");
+  mkdirSync(incompleteSource, { recursive: true });
+  git(incompleteSource, "init", "--initial-branch=main");
+  writeFileSync(path.join(incompleteSource, "README.md"), "# Incomplete runtime\n");
+  git(incompleteSource, "add", ".");
+  git(incompleteSource, "commit", "-m", "Incomplete runtime");
+  git(temporary, "clone", "--bare", incompleteSource, backend.runtimeRemote);
+  const root = path.join(temporary, "test-space");
+  const input = coordinatorManifestSchema.parse({
+    schemaVersion: 2,
+    name: "test-space",
+    repositories: [
+      {
+        id: "backend",
+        path: "market-intel-back-end",
+        url: backend.remote,
+        agent: { instructions: [], verify: [], skills: [] },
+      },
+    ],
+    agents: {
+      tools: ["codex"],
+      maxParallel: 1,
+      skillCollision: "namespace",
+    },
+  });
+
+  assert.throws(
+    () =>
+      initializeWorkspace(root, input, "0.3.0", {
+        discoverSkills: true,
+        installHooks: false,
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "code" in error);
+      assert.equal(error.code, "NESTED_SUBMODULE_REPAIR_REQUIRED");
+      assert.match(
+        error.message,
+        /backend.*nested checkout was deinitialized.*local repair/is,
+      );
+      return true;
+    },
+  );
+  assert.equal(existsSync(path.join(root, ".coordinator", "agents.lock.json")), false);
+  assert.match(git(root, "submodule", "status", "--recursive"), /^-/m);
+
+  renameSync(backend.runtimeRemote, `${backend.runtimeRemote}.incomplete`);
+  renameSync(completeRuntime, backend.runtimeRemote);
+  initializeWorkspace(root, input, "0.3.0", {
+    discoverSkills: true,
+    installHooks: false,
+  });
+  assert.equal(loadManifest(root).manifest.repositories[0]!.agent.skills.length, 4);
 });
 
 test("legacy Git Coordinator configuration migrates without changing it", (context) => {

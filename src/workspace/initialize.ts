@@ -3,13 +3,20 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
 } from "node:fs";
 import path from "node:path";
 import { runCommand, type CommandResult } from "../core/command.js";
-import { CoordinatorError } from "../core/errors.js";
+import { CoordinatorError, errorMessage } from "../core/errors.js";
 import { applyFilePlans, planFile } from "../core/files.js";
 import { loadManifest, renderManifest } from "../core/manifest.js";
+import {
+  parseRepositoryIdentity,
+  redactRepositoryUrl,
+  repositoryCloneUrl,
+  repositoryUrlsMatch as supportedRepositoryUrlsMatch,
+} from "../core/repository-url.js";
 import {
   coordinatorManifestSchema,
   type CoordinatorManifest,
@@ -21,6 +28,11 @@ import {
   invokeGitRuntime,
 } from "../git/install.js";
 import { discoverSkillSources } from "../agents/skills.js";
+import {
+  NestedSubmoduleRepairRequiredError,
+  planNestedSubmoduleRepair,
+  redactNestedSubmoduleDiagnostic,
+} from "./nested-repair.js";
 import { synchronizeWorkspace, type WorkspaceSyncResult } from "./sync.js";
 
 export interface InitializeOptions {
@@ -49,9 +61,7 @@ export interface InitializeResult {
   sync: WorkspaceSyncResult | null;
 }
 
-export function repositoryCloneUrl(url: string): string {
-  return /^[^/:]+\/[^/]+$/.test(url) ? `git@github.com:${url}.git` : url;
-}
+export { repositoryCloneUrl } from "../core/repository-url.js";
 
 function gitResult(
   root: string,
@@ -86,28 +96,28 @@ function canonicalPath(value: string): string {
   }
 }
 
-function githubRepository(value: string): string | null {
-  const normalized = value
-    .trim()
-    .replace(/^git@github\.com:/i, "")
-    .replace(/^ssh:\/\/git@github\.com\//i, "")
-    .replace(/^https?:\/\/github\.com\//i, "")
-    .replace(/\.git$/i, "")
-    .replace(/\/+$/, "");
-  return /^[^/]+\/[^/]+$/.test(normalized)
-    ? normalized.toLowerCase()
-    : null;
+function isPathWithin(base: string, candidate: string): boolean {
+  const relative = path.relative(base, candidate);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`))
+  );
 }
 
 function repositoryUrlsMatch(expectedInput: string, actualInput: string): boolean {
   const expected = repositoryCloneUrl(expectedInput);
-  const expectedGithub = githubRepository(expected);
-  const actualGithub = githubRepository(actualInput);
-  if (expectedGithub && actualGithub) return expectedGithub === actualGithub;
+  if (
+    parseRepositoryIdentity(expected) ||
+    parseRepositoryIdentity(actualInput)
+  ) {
+    return supportedRepositoryUrlsMatch(expected, actualInput);
+  }
   if (path.isAbsolute(expected) && path.isAbsolute(actualInput)) {
     return canonicalPath(expected) === canonicalPath(actualInput);
   }
-  return expected.replace(/\/+$/, "") === actualInput.replace(/\/+$/, "");
+  return supportedRepositoryUrlsMatch(expected, actualInput);
 }
 
 function existingRepositoryError(
@@ -166,7 +176,21 @@ function validateMaterializedRepository(
   root: string,
   repository: Repository,
 ): void {
-  const repositoryDirectory = path.join(root, repository.path);
+  const absoluteRoot = path.resolve(root);
+  const repositoryDirectory = path.resolve(root, repository.path);
+  if (!isPathWithin(absoluteRoot, repositoryDirectory)) {
+    throw existingRepositoryError(repository, "the destination escapes the coordinator root");
+  }
+  let cursor = absoluteRoot;
+  for (const segment of path.relative(absoluteRoot, repositoryDirectory).split(path.sep)) {
+    cursor = path.join(cursor, segment);
+    if (pathExists(cursor) && lstatSync(cursor).isSymbolicLink()) {
+      throw existingRepositoryError(
+        repository,
+        `the destination crosses symbolic link '${path.relative(absoluteRoot, cursor)}'`,
+      );
+    }
+  }
   if (!pathExists(repositoryDirectory)) {
     throw new CoordinatorError(
       `Repository '${repository.id}' is not materialized at '${repository.path}'.`,
@@ -177,7 +201,7 @@ function validateMaterializedRepository(
   if (!repositoryUrlsMatch(repository.url, configured.url)) {
     throw existingRepositoryError(
       repository,
-      `.gitmodules URL '${configured.url}' does not match '${repositoryCloneUrl(repository.url)}'`,
+      `.gitmodules URL '${redactRepositoryUrl(configured.url)}' does not match '${redactRepositoryUrl(repositoryCloneUrl(repository.url))}'`,
     );
   }
 
@@ -201,6 +225,7 @@ function validateMaterializedRepository(
   );
   if (
     topLevel.status !== 0 ||
+    !topLevel.stdout ||
     canonicalPath(topLevel.stdout) !== canonicalPath(repositoryDirectory)
   ) {
     throw existingRepositoryError(repository, "the destination is not that submodule's Git worktree");
@@ -212,6 +237,7 @@ function validateMaterializedRepository(
   );
   if (
     superproject.status !== 0 ||
+    !superproject.stdout ||
     canonicalPath(superproject.stdout) !== canonicalPath(root)
   ) {
     throw existingRepositoryError(repository, "the Git worktree belongs to another superproject");
@@ -234,8 +260,252 @@ function validateMaterializedRepository(
   ) {
     throw existingRepositoryError(
       repository,
-      `origin URL '${origin.stdout || "missing"}' does not match '${repositoryCloneUrl(repository.url)}'`,
+      `origin URL '${origin.stdout ? redactRepositoryUrl(origin.stdout) : "missing"}' does not match '${redactRepositoryUrl(repositoryCloneUrl(repository.url))}'`,
     );
+  }
+}
+
+interface NestedSubmodulePlan {
+  directory: string;
+  repository: Repository;
+  root: string;
+  submodules: IndexedSubmodule[];
+}
+
+interface IndexedSubmodule {
+  commit: string;
+  path: string;
+  stage: string;
+}
+
+function nestedCheckoutPath(
+  directory: string,
+  relativePath: string,
+  label: string,
+): string {
+  const parent = path.resolve(directory);
+  const checkout = path.resolve(directory, relativePath);
+  const relative = path.relative(parent, checkout);
+  if (
+    !relative ||
+    path.isAbsolute(relative) ||
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`)
+  ) {
+    throw new CoordinatorError(
+      `${label} has unsafe nested gitlink path '${relativePath}'.`,
+      "NESTED_SUBMODULE_PATH_INVALID",
+    );
+  }
+  let cursor = parent;
+  for (const segment of relative.split(path.sep)) {
+    cursor = path.join(cursor, segment);
+    if (pathExists(cursor) && lstatSync(cursor).isSymbolicLink()) {
+      throw new CoordinatorError(
+        `${label} nested gitlink '${relativePath}' crosses symbolic link '${path.relative(parent, cursor)}'.`,
+        "NESTED_SUBMODULE_PATH_INVALID",
+      );
+    }
+  }
+  if (
+    pathExists(checkout) &&
+    !isPathWithin(canonicalPath(parent), canonicalPath(checkout))
+  ) {
+    throw new CoordinatorError(
+      `${label} nested gitlink '${relativePath}' resolves outside its parent repository.`,
+      "NESTED_SUBMODULE_PATH_INVALID",
+    );
+  }
+  return checkout;
+}
+
+function indexedSubmodules(directory: string): IndexedSubmodule[] {
+  const configured = gitResult(
+    directory,
+    [
+      "config",
+      "--blob=HEAD:.gitmodules",
+      "-z",
+      "--get-regexp",
+      "^submodule\\..*\\.path$",
+    ],
+    true,
+  );
+  if (configured.status !== 0) return [];
+  const paths = configured.stdout
+    .split("\0")
+    .filter(Boolean)
+    .map((entry) => entry.slice(entry.indexOf("\n") + 1))
+    .filter(Boolean);
+  if (!paths.length) return [];
+
+  const result = gitResult(
+    directory,
+    ["ls-files", "--stage", "-z", "--", ...paths],
+    true,
+  );
+  if (result.status !== 0) {
+    throw new CoordinatorError(
+      `Could not inspect nested gitlinks at '${directory}': ${result.stderr || result.stdout || `exit ${result.status}`}.`,
+      "NESTED_SUBMODULE_STATUS_FAILED",
+    );
+  }
+  return result.stdout
+    .split("\0")
+    .filter(Boolean)
+    .map((entry) => /^(\d{6}) ([0-9a-f]{40,64}) ([0-3])\t([\s\S]+)$/.exec(entry))
+    .filter((entry): entry is RegExpExecArray => entry?.[1] === "160000")
+    .map((entry) => ({
+      commit: entry[2]!,
+      path: entry[4]!,
+      stage: entry[3]!,
+    }));
+}
+
+function planNestedSubmodules(
+  root: string,
+  repository: Repository,
+): NestedSubmodulePlan[] {
+  const plans: NestedSubmodulePlan[] = [];
+  const visited = new Set<string>();
+  const inspect = (directory: string, label: string): void => {
+    const directoryRealPath = canonicalPath(directory);
+    if (visited.has(directoryRealPath)) return;
+    visited.add(directoryRealPath);
+
+    const missing: IndexedSubmodule[] = [];
+    const initialized: Array<{ directory: string; label: string }> = [];
+    for (const submodule of indexedSubmodules(directory)) {
+      if (submodule.stage !== "0") {
+        throw new CoordinatorError(
+          `${label} has an unresolved nested gitlink at '${submodule.path}'. Resolve the index before rerunning init.`,
+          "NESTED_SUBMODULE_CONFLICT",
+        );
+      }
+      const checkout = nestedCheckoutPath(directory, submodule.path, label);
+      const topLevel = gitResult(checkout, ["rev-parse", "--show-toplevel"], true);
+      if (
+        topLevel.status !== 0 ||
+        !topLevel.stdout ||
+        canonicalPath(topLevel.stdout) !== canonicalPath(checkout)
+      ) {
+        if (
+          pathExists(checkout) &&
+          (!lstatSync(checkout).isDirectory() || readdirSync(checkout).length > 0)
+        ) {
+          throw new CoordinatorError(
+            `${label} nested gitlink '${submodule.path}' is occupied by an unrecognized checkout or files. Init will not overwrite it.`,
+            "NESTED_SUBMODULE_PATH_INVALID",
+          );
+        }
+        missing.push(submodule);
+        continue;
+      }
+      const superproject = gitResult(
+        checkout,
+        ["rev-parse", "--show-superproject-working-tree"],
+        true,
+      );
+      if (
+        superproject.status !== 0 ||
+        !superproject.stdout ||
+        canonicalPath(superproject.stdout) !== canonicalPath(directory)
+      ) {
+        throw new CoordinatorError(
+          `${label} nested submodule '${submodule.path}' is not owned by its declared parent worktree.`,
+          "NESTED_SUBMODULE_PATH_INVALID",
+        );
+      }
+      const head = gitResult(checkout, ["rev-parse", "HEAD"], true);
+      if (head.status !== 0 || head.stdout !== submodule.commit) {
+        throw new CoordinatorError(
+          `${label} nested submodule '${submodule.path}' is at ${head.stdout || "an unreadable HEAD"}, but its gitlink pins ${submodule.commit}. Init will not move an existing checkout; restore or commit its intended gitlink first.`,
+          "NESTED_SUBMODULE_GITLINK_MISMATCH",
+        );
+      }
+      initialized.push({
+        directory: checkout,
+        label: `${label} nested submodule '${submodule.path}'`,
+      });
+    }
+    if (missing.length) {
+      plans.push({
+        directory,
+        repository,
+        root,
+        submodules: missing.sort((left, right) =>
+          left.path.localeCompare(right.path),
+        ),
+      });
+    }
+    for (const child of initialized) inspect(child.directory, child.label);
+  };
+
+  inspect(
+    path.join(root, repository.path),
+    `Repository '${repository.id}'`,
+  );
+  return plans;
+}
+
+function initializeNestedSubmodules(plans: NestedSubmodulePlan[]): void {
+  for (const plan of plans) {
+    for (const submodule of plan.submodules) {
+      const result = gitResult(
+        plan.directory,
+        [
+          "submodule",
+          "update",
+          "--init",
+          "--recursive",
+          "--checkout",
+          "--",
+          submodule.path,
+        ],
+        true,
+      );
+      if (result.status !== 0) {
+        const detail = result.stderr || result.stdout || `exit ${result.status}`;
+        const safeDetail = redactNestedSubmoduleDiagnostic(detail);
+        const rollback = gitResult(
+          plan.directory,
+          ["submodule", "deinit", "-f", "--", submodule.path],
+          true,
+        );
+        const rollbackDetail = rollback.stderr || rollback.stdout;
+        if (rollback.status !== 0) {
+          throw new CoordinatorError(
+            `Could not initialize nested submodule '${submodule.path}' for repository '${plan.repository.id}': ${safeDetail}. Cleanup of the newly created nested checkout also failed: ${redactNestedSubmoduleDiagnostic(rollbackDetail || `exit ${rollback.status}`)}. Inspect that path before retrying.`,
+            "NESTED_SUBMODULE_ROLLBACK_FAILED",
+          );
+        }
+
+        let repairUnavailable = "";
+        const topLevelParent = path.join(
+          plan.root,
+          plan.repository.path,
+        );
+        if (
+          canonicalPath(plan.directory) === canonicalPath(topLevelParent)
+        ) {
+          try {
+            const repairPlan = planNestedSubmoduleRepair(
+              plan.root,
+              plan.repository,
+              submodule.path,
+            );
+            throw new NestedSubmoduleRepairRequiredError(repairPlan, safeDetail);
+          } catch (error) {
+            if (error instanceof NestedSubmoduleRepairRequiredError) throw error;
+            repairUnavailable = ` Automatic repair is unavailable: ${errorMessage(error)}`;
+          }
+        }
+        throw new CoordinatorError(
+          `Could not initialize nested submodule '${submodule.path}' for repository '${plan.repository.id}': ${safeDetail}. The newly created checkout was rolled back by deinitializing that nested path; coordinator.yaml and top-level checkouts were preserved.${repairUnavailable} Resolve access or the parent gitlink and rerun init.`,
+          "NESTED_SUBMODULE_INIT_FAILED",
+        );
+      }
+    }
   }
 }
 
@@ -250,6 +520,7 @@ function validateExistingDestinations(
   const topLevel = gitResult(root, ["rev-parse", "--show-toplevel"], true);
   if (
     topLevel.status !== 0 ||
+    !topLevel.stdout ||
     canonicalPath(topLevel.stdout) !== canonicalPath(root)
   ) {
     throw existingRepositoryError(
@@ -444,6 +715,12 @@ export function initializeWorkspace(
   for (const repository of materialized) {
     validateMaterializedRepository(root, repository);
   }
+  if (addSubmodules && !dryRun) {
+    const nestedPlans = materialized.flatMap((repository) =>
+      planNestedSubmodules(root, repository),
+    );
+    initializeNestedSubmodules(nestedPlans);
+  }
   const missingSubmodules = manifest.repositories
     .filter((repository) => !pathExists(path.join(root, repository.path)))
     .map((repository) => repository.id);
@@ -459,7 +736,7 @@ export function initializeWorkspace(
       if (repository.agent.skills.length) continue;
       repository.agent.skills = discoverSkillSources(
         path.join(root, repository.path),
-      ).map((source) => ({ source }));
+      );
     }
     const discoveredManifestPlan = planFile(
       root,

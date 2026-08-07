@@ -1,5 +1,9 @@
 import path from "node:path";
 import { z } from "zod";
+import {
+  parseRepositoryIdentity,
+  repositoryCloneUrl,
+} from "./repository-url.js";
 
 const identifier = z
   .string()
@@ -9,6 +13,17 @@ const singleLine = z.string().min(1).refine(
   (value) => !/[\r\n]/.test(value),
   "must be a single line",
 );
+
+const repositoryUrl = singleLine.superRefine((value, context) => {
+  try {
+    repositoryCloneUrl(value);
+  } catch (error) {
+    context.addIssue({
+      code: "custom",
+      message: error instanceof Error ? error.message : "invalid repository URL",
+    });
+  }
+});
 
 const relativePath = z.string().min(1).refine(
   (value) =>
@@ -58,6 +73,7 @@ export const branchPolicySchema = z.discriminatedUnion("mode", [
 const skillExportSchema = z.object({
   source: relativePath,
   name: identifier.optional(),
+  kind: z.enum(["skill", "flow"]).optional(),
 });
 
 const repositoryAgentSchema = z.object({
@@ -71,7 +87,7 @@ const repositoryAgentSchema = z.object({
 export const repositorySchema = z.object({
   id: identifier,
   path: relativePath,
-  url: singleLine,
+  url: repositoryUrl,
   branch: branchPolicySchema.default({ mode: "mirror", readOnly: false }),
   agent: repositoryAgentSchema.default({
     instructions: [],
@@ -86,7 +102,7 @@ const agentsSchema = z.object({
   manage: z.boolean().optional(),
   tools: z.array(agentTools).min(1).default(["codex"]),
   maxParallel: z.number().int().positive().max(16).default(4),
-  skillCollision: z.enum(["namespace", "error"]).default("namespace"),
+  skillCollision: z.enum(["namespace", "error"]).default("error"),
 });
 
 const workflowRunStateSchema = z.object({
@@ -121,18 +137,20 @@ const deploymentEnvironmentSchema = z.object({
     ),
 });
 
-const deploymentsSchema = z.object({
-  tokenSecret: z
-    .string()
-    .regex(/^[A-Z_][A-Z0-9_]*$/, "must be an uppercase GitHub secret name")
-    .default("SUBREPO_ACTIONS_TOKEN"),
-  environments: z
-    .record(identifier, deploymentEnvironmentSchema)
-    .refine(
-      (environments) => Object.keys(environments).length > 0,
-      "must contain at least one deployment environment",
-    ),
-});
+const deploymentsSchema = z
+  .object({
+    tokenSecret: z
+      .string()
+      .regex(/^[A-Z_][A-Z0-9_]*$/, "must be an uppercase GitHub secret name")
+      .default("SUBREPO_ACTIONS_TOKEN"),
+    environments: z
+      .record(identifier, deploymentEnvironmentSchema)
+      .refine(
+        (environments) => Object.keys(environments).length > 0,
+        "must contain at least one deployment environment",
+      ),
+  })
+  .strict();
 
 const workspaceManifestSchema = z.object({
   path: relativePath,
@@ -188,7 +206,7 @@ export const coordinatorManifestSchema = z
     agents: agentsSchema.default({
       tools: ["codex"],
       maxParallel: 4,
-      skillCollision: "namespace",
+      skillCollision: "error",
     }),
     deployments: deploymentsSchema.optional(),
   })
@@ -215,7 +233,6 @@ export const coordinatorManifestSchema = z
         message: "is legacy schemaVersion 1 syntax; embed the selection in workspace",
       });
     }
-
     const ids = new Set<string>();
     const paths = new Set<string>();
     const agentNames = new Set<string>();
@@ -287,6 +304,27 @@ export const coordinatorManifestSchema = z
               "repository",
             ],
             message: `unknown repository '${component.repository}'`,
+          });
+          continue;
+        }
+        const repository = manifest.repositories.find(
+          (candidate) => candidate.id === component.repository,
+        );
+        if (
+          repository &&
+          parseRepositoryIdentity(repository.url)?.provider !== "github"
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: [
+              "deployments",
+              "environments",
+              environmentName,
+              "components",
+              componentName,
+              "repository",
+            ],
+            message: `repository '${component.repository}' must use a GitHub URL for coordinated deployments`,
           });
         }
       }

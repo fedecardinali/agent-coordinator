@@ -69,3 +69,23 @@ test("atomic writes do not reuse a predictable temporary symlink", (context) => 
   assert.equal(readFileSync(outside, "utf8"), "outside\n");
   assert.equal(existsSync(predictable), true);
 });
+
+test("a stale later file plan prevents every earlier publication", (context) => {
+  const root = temporaryDirectory("agent-coordinator-file-transaction-");
+  context.after(() => rmSync(root, { recursive: true }));
+  const first = planFile(root, "generated/first.txt", "first\n");
+  const second = planFile(root, "generated/second.txt", "second\n");
+  mkdirSync(path.join(root, "generated"));
+  writeFileSync(path.join(root, "generated", "second.txt"), "concurrent\n");
+
+  assert.throws(
+    () => applyFilePlans([first, second]),
+    /changed after planning/,
+  );
+
+  assert.equal(existsSync(path.join(root, "generated", "first.txt")), false);
+  assert.equal(
+    readFileSync(path.join(root, "generated", "second.txt"), "utf8"),
+    "concurrent\n",
+  );
+});

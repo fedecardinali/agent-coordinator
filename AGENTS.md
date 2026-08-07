@@ -22,7 +22,12 @@ runtime installed by Agent Coordinator.
 - Never test repository creation, commits, pushes, or worktrees against a real
   project. Use temporary repositories and local bare remotes.
 - Never overwrite an unmanaged file silently.
-- Never copy dirty working-tree skill files; materialize committed Git trees.
+- Publish skills only as relative links to clean, gitlink-pinned source trees;
+  never copy working-tree skill files or follow a source link outside the
+  coordinator workspace.
+- Preserve schema-1 skill locks long enough to migrate intact managed copies;
+  modified or unmanaged registry entries require an explicit forced preview
+  and sync.
 - Never store tokens or secret values in the workspace manifest or lockfile.
 - Machine installation may replace only recognized Agent Coordinator or legacy
   Git Coordinator wrappers, and workspace reinstall must preserve unrelated

@@ -121,14 +121,23 @@ export function runDoctor(
   checks.push(
     check("Generated outputs", () => {
       const result = synchronizeWorkspace(root, manifest, version, { check: true });
-      return result.changed
-        ? { detail: "generated files are stale; run coordinator sync", status: "fail" }
-        : {
-            detail:
-              manifest.agents.manage === false
-                ? "CI is synchronized; existing agent files are intentionally unmanaged"
-                : "agents, skills, and CI are synchronized",
-          };
+      if (result.changed) {
+        const skillDetail = result.agents.skillMigrations.length
+          ? `; ${result.agents.skillMigrations.length} managed skill ${result.agents.skillMigrations.length === 1 ? "copy is ready" : "copies are ready"} to migrate`
+          : result.agents.skillActions.length
+            ? `; ${result.agents.skillActions.length} skill link ${result.agents.skillActions.length === 1 ? "change is" : "changes are"} planned`
+            : "";
+        return {
+          detail: `generated outputs are stale${skillDetail}; run coordinator sync`,
+          status: "fail",
+        };
+      }
+      return {
+        detail:
+          manifest.agents.manage === false
+            ? "CI is synchronized; existing agent files are intentionally unmanaged"
+            : "agents, skill links, and CI are synchronized",
+      };
     }),
   );
   checks.push(

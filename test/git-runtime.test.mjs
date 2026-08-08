@@ -460,6 +460,18 @@ function localBranchExists(repository, name) {
   );
 }
 
+function worktreePaths(repository) {
+  return gitText(repository, "worktree", "list", "--porcelain")
+    .split(/\n\n+/)
+    .map((record) =>
+      record
+        .split("\n")
+        .find((line) => line.startsWith("worktree ")),
+    )
+    .filter(Boolean)
+    .map((line) => line.slice("worktree ".length));
+}
+
 test("delegates to ordinary Git outside a configured coordinator", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "ordinary-git-"));
   const invocation = wrapperInvocation(["--version"]);
@@ -526,12 +538,7 @@ test("checkout -b and switch -c create coordinated branches from origin/main in 
     const fixture = createFixture(manifestPolicyConfiguration());
     const stale = createStaleLinkedSnapshot(fixture);
     const branchName = `hotfix/${command}-origin-main`;
-    const worktreesBefore = gitText(
-      stale.worktree,
-      "worktree",
-      "list",
-      "--porcelain",
-    );
+    const worktreesBefore = worktreePaths(stale.worktree);
     const targetRevision = gitText(stale.worktree, "rev-parse", "origin/main");
     const backendGitlink = gitText(
       stale.worktree,
@@ -562,10 +569,7 @@ test("checkout -b and switch -c create coordinated branches from origin/main in 
       gitText(fixture.coordinator, "rev-parse", "refs/heads/main"),
       stale.mainRevision,
     );
-    assert.equal(
-      gitText(stale.worktree, "worktree", "list", "--porcelain"),
-      worktreesBefore,
-    );
+    assert.deepEqual(worktreePaths(stale.worktree), worktreesBefore);
   }
 });
 

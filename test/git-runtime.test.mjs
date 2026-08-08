@@ -415,9 +415,13 @@ function createStaleLinkedSnapshot(fixture) {
   write(fixture.backend, "target-backend.txt", "target backend\n");
   git(fixture.backend, "add", "target-backend.txt");
   git(fixture.backend, "commit", "--quiet", "-m", "advance backend");
+  git(fixture.backend, "push", "--quiet", "origin", "main");
   write(fixture.frontend, "target-frontend.txt", "target frontend\n");
   git(fixture.frontend, "add", "target-frontend.txt");
   git(fixture.frontend, "commit", "--quiet", "-m", "advance frontend");
+  git(fixture.frontend, "push", "--quiet", "origin", "main");
+  git(path.join(worktree, "apps/backend"), "fetch", "--quiet", "origin");
+  git(path.join(worktree, "apps/frontend"), "fetch", "--quiet", "origin");
   git(fixture.coordinator, "add", "apps/backend", "apps/frontend");
   git(
     fixture.coordinator,
@@ -634,7 +638,7 @@ test("start-point branch creation rejects invalid revisions and dirty worktrees 
     "origin/main",
   );
   assert.notEqual(dirty.status, 0);
-  assert.match(dirty.stderr, /requires clean worktrees: backend/i);
+  assert.match(dirty.stderr, /requires clean worktrees: .*backend/i);
   assert.equal(revision(dirtyFixture.coordinator), dirtyRootRevision);
   assert.equal(localBranchExists(dirtyFixture.coordinator, "hotfix/dirty-start-point"), false);
   assert.equal(branch(dirtyFixture.backend), "main");

@@ -371,6 +371,91 @@ function writeCoordinatorYaml(fixture, manifest) {
   );
 }
 
+function createStaleLinkedSnapshot(fixture) {
+  const manifestPath = path.join(fixture.coordinator, "workspace.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.repositories.frontend.mode = "pinned";
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  git(fixture.coordinator, "add", "workspace.json");
+  git(fixture.coordinator, "commit", "--quiet", "-m", "pin frontend");
+  git(fixture.coordinator, "push", "--quiet", "origin", "main");
+
+  const staleRevision = revision(fixture.coordinator);
+  const worktree = path.join(fixture.temporaryDirectory, "codex-stale");
+  run(REAL_GIT, [
+    "-C",
+    fixture.coordinator,
+    "worktree",
+    "add",
+    "--quiet",
+    "--detach",
+    worktree,
+    staleRevision,
+  ]);
+  run(REAL_GIT, [
+    "-C",
+    worktree,
+    "-c",
+    "protocol.file.allow=always",
+    "submodule",
+    "update",
+    "--init",
+    "--recursive",
+  ]);
+  const staleBranch = "codex/stale-origin-main";
+  git(worktree, "switch", "--quiet", "-c", staleBranch);
+  git(
+    path.join(worktree, "apps/backend"),
+    "switch",
+    "--quiet",
+    "-c",
+    staleBranch,
+  );
+
+  write(fixture.backend, "target-backend.txt", "target backend\n");
+  git(fixture.backend, "add", "target-backend.txt");
+  git(fixture.backend, "commit", "--quiet", "-m", "advance backend");
+  write(fixture.frontend, "target-frontend.txt", "target frontend\n");
+  git(fixture.frontend, "add", "target-frontend.txt");
+  git(fixture.frontend, "commit", "--quiet", "-m", "advance frontend");
+  git(fixture.coordinator, "add", "apps/backend", "apps/frontend");
+  git(
+    fixture.coordinator,
+    "commit",
+    "--quiet",
+    "-m",
+    "advance coordinated snapshot",
+  );
+  git(fixture.coordinator, "push", "--quiet", "origin", "main");
+  git(fixture.coordinator, "fetch", "--quiet", "origin");
+
+  return {
+    backend: path.join(worktree, "apps/backend"),
+    frontend: path.join(worktree, "apps/frontend"),
+    mainRevision: gitText(fixture.coordinator, "rev-parse", "refs/heads/main"),
+    staleBranch,
+    staleRevision,
+    worktree,
+  };
+}
+
+function localBranchExists(repository, name) {
+  return (
+    run(
+      REAL_GIT,
+      [
+        "-C",
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        `refs/heads/${name}`,
+      ],
+      { allowFailure: true },
+    ).status === 0
+  );
+}
+
 test("delegates to ordinary Git outside a configured coordinator", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "ordinary-git-"));
   const invocation = wrapperInvocation(["--version"]);
@@ -427,6 +512,184 @@ test("git checkout -b and git checkout switch all coordinated repositories", () 
   assert.equal(branch(fixture.coordinator), "main");
   assert.equal(branch(fixture.backend), "main");
   assert.equal(branch(fixture.frontend), "main");
+});
+
+test("checkout -b and switch -c create coordinated branches from origin/main in stale linked worktrees", () => {
+  for (const [command, createFlag] of [
+    ["checkout", "-b"],
+    ["switch", "-c"],
+  ]) {
+    const fixture = createFixture(manifestPolicyConfiguration());
+    const stale = createStaleLinkedSnapshot(fixture);
+    const branchName = `hotfix/${command}-origin-main`;
+    const worktreesBefore = gitText(
+      stale.worktree,
+      "worktree",
+      "list",
+      "--porcelain",
+    );
+    const targetRevision = gitText(stale.worktree, "rev-parse", "origin/main");
+    const backendGitlink = gitText(
+      stale.worktree,
+      "rev-parse",
+      "origin/main:apps/backend",
+    );
+    const frontendGitlink = gitText(
+      stale.worktree,
+      "rev-parse",
+      "origin/main:apps/frontend",
+    );
+
+    coordinated(
+      stale.worktree,
+      command,
+      createFlag,
+      branchName,
+      "origin/main",
+    );
+
+    assert.equal(branch(stale.worktree), branchName);
+    assert.equal(revision(stale.worktree), targetRevision);
+    assert.equal(branch(stale.backend), branchName);
+    assert.equal(revision(stale.backend), backendGitlink);
+    assert.equal(branch(stale.frontend), "");
+    assert.equal(revision(stale.frontend), frontendGitlink);
+    assert.equal(
+      gitText(fixture.coordinator, "rev-parse", "refs/heads/main"),
+      stale.mainRevision,
+    );
+    assert.equal(
+      gitText(stale.worktree, "worktree", "list", "--porcelain"),
+      worktreesBefore,
+    );
+  }
+});
+
+test("start-point branch creation rejects invalid revisions and dirty worktrees before writing", () => {
+  const invalidFixture = createFixture();
+  const invalidRootRevision = revision(invalidFixture.coordinator);
+  const invalid = coordinatedAllowFailure(
+    invalidFixture.coordinator,
+    "switch",
+    "-c",
+    "hotfix/invalid-start-point",
+    "origin/not-a-branch",
+  );
+  assert.notEqual(invalid.status, 0);
+  assert.match(invalid.stderr, /does not resolve to a commit/i);
+  assert.equal(revision(invalidFixture.coordinator), invalidRootRevision);
+  assert.equal(localBranchExists(invalidFixture.coordinator, "hotfix/invalid-start-point"), false);
+  assert.equal(branch(invalidFixture.backend), "main");
+  assert.equal(branch(invalidFixture.frontend), "main");
+
+  const configurationFixture = createFixture();
+  git(
+    configurationFixture.coordinator,
+    "checkout",
+    "--quiet",
+    "-b",
+    "legacy/no-coordinator",
+  );
+  git(
+    configurationFixture.coordinator,
+    "rm",
+    "--quiet",
+    ".git-coordinator.json",
+  );
+  git(
+    configurationFixture.coordinator,
+    "commit",
+    "--quiet",
+    "-m",
+    "remove coordinator configuration",
+  );
+  git(configurationFixture.coordinator, "checkout", "--quiet", "main");
+  const configurationRootRevision = revision(configurationFixture.coordinator);
+  const configuration = coordinatedAllowFailure(
+    configurationFixture.coordinator,
+    "checkout",
+    "-b",
+    "hotfix/uninterpretable-start-point",
+    "legacy/no-coordinator",
+  );
+  assert.notEqual(configuration.status, 0);
+  assert.match(configuration.stderr, /does not contain an interpretable coordinator configuration/i);
+  assert.equal(revision(configurationFixture.coordinator), configurationRootRevision);
+  assert.equal(
+    localBranchExists(
+      configurationFixture.coordinator,
+      "hotfix/uninterpretable-start-point",
+    ),
+    false,
+  );
+
+  const dirtyFixture = createFixture();
+  const dirtyRootRevision = revision(dirtyFixture.coordinator);
+  write(dirtyFixture.backend, "dirty.txt", "dirty\n");
+  const dirty = coordinatedAllowFailure(
+    dirtyFixture.coordinator,
+    "checkout",
+    "-b",
+    "hotfix/dirty-start-point",
+    "origin/main",
+  );
+  assert.notEqual(dirty.status, 0);
+  assert.match(dirty.stderr, /requires clean worktrees: backend/i);
+  assert.equal(revision(dirtyFixture.coordinator), dirtyRootRevision);
+  assert.equal(localBranchExists(dirtyFixture.coordinator, "hotfix/dirty-start-point"), false);
+  assert.equal(branch(dirtyFixture.backend), "main");
+});
+
+test("start-point branch creation preflights child collisions and rolls back child checkout failures", () => {
+  const collisionFixture = createFixture(manifestPolicyConfiguration());
+  const collision = createStaleLinkedSnapshot(collisionFixture);
+  const collisionBranch = "hotfix/child-collision";
+  const collisionRootRevision = revision(collision.worktree);
+  git(collision.backend, "branch", collisionBranch);
+
+  const collisionResult = coordinatedAllowFailure(
+    collision.worktree,
+    "switch",
+    "-c",
+    collisionBranch,
+    "origin/main",
+  );
+  assert.notEqual(collisionResult.status, 0);
+  assert.match(collisionResult.stderr, /expected gitlink/i);
+  assert.equal(revision(collision.worktree), collisionRootRevision);
+  assert.equal(branch(collision.worktree), collision.staleBranch);
+  assert.equal(localBranchExists(collision.worktree, collisionBranch), false);
+  assert.equal(localBranchExists(collision.backend, collisionBranch), true);
+
+  const failureFixture = createFixture(manifestPolicyConfiguration());
+  const failure = createStaleLinkedSnapshot(failureFixture);
+  const failureBranch = "hotfix/child-checkout-failure";
+  const originalRootRevision = revision(failure.worktree);
+  const originalBackendRevision = revision(failure.backend);
+  const originalFrontendRevision = revision(failure.frontend);
+  const hooks = path.join(failureFixture.temporaryDirectory, "reject-checkout");
+  mkdirSync(hooks);
+  writeFileSync(path.join(hooks, "post-checkout"), "#!/bin/sh\nexit 1\n", {
+    mode: 0o755,
+  });
+  git(failure.frontend, "config", "core.hooksPath", hooks);
+
+  const failureResult = coordinatedAllowFailure(
+    failure.worktree,
+    "checkout",
+    "-b",
+    failureBranch,
+    "origin/main",
+  );
+  assert.notEqual(failureResult.status, 0);
+  assert.equal(revision(failure.worktree), originalRootRevision);
+  assert.equal(branch(failure.worktree), failure.staleBranch);
+  assert.equal(revision(failure.backend), originalBackendRevision);
+  assert.equal(branch(failure.backend), failure.staleBranch);
+  assert.equal(revision(failure.frontend), originalFrontendRevision);
+  assert.equal(branch(failure.frontend), "");
+  assert.equal(localBranchExists(failure.worktree, failureBranch), false);
+  assert.equal(localBranchExists(failure.backend, failureBranch), false);
 });
 
 test("v2 mirror and fixed policies coordinate different branches", () => {

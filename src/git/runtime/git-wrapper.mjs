@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  unlinkSync,
   readFileSync,
   realpathSync,
   writeFileSync,
@@ -2134,6 +2135,296 @@ function createCoordinatedBranch(context, branch) {
   }
 }
 
+function resolveStartPointCommit(context, startPoint) {
+  const result = gitText(
+    context.rootDirectory,
+    ["rev-parse", "--verify", `${startPoint}^{commit}`],
+    { allowFailure: true },
+  );
+  if (result.status !== 0) {
+    throw new CoordinatedGitError(
+      `start-point '${startPoint}' does not resolve to a commit in the coordinator.`,
+    );
+  }
+  return result.stdout;
+}
+
+function assertRepositoriesClean(contexts) {
+  const repositories = new Map();
+  for (const context of contexts) {
+    repositories.set(context.rootDirectory, "coordinator");
+    for (const repository of context.repositories) {
+      repositories.set(repository.directory, repository.id);
+    }
+  }
+
+  const dirty = [];
+  for (const [directory, label] of repositories) {
+    const status = gitText(directory, [
+      "status",
+      "--porcelain",
+      "--untracked-files=normal",
+      "--ignore-submodules=none",
+    ]);
+    if (status.stdout) dirty.push(label);
+  }
+  if (dirty.length > 0) {
+    throw new CoordinatedGitError(
+      `coordinated branch creation from a start-point requires clean worktrees: ${dirty.join(", ")}.`,
+    );
+  }
+}
+
+function assertCommitAvailable(repository, revision) {
+  const result = gitText(
+    repository.directory,
+    ["cat-file", "-e", `${revision}^{commit}`],
+    { allowFailure: true },
+  );
+  if (result.status !== 0) {
+    throw new CoordinatedGitError(
+      `${repository.id} does not contain gitlink commit ${revision.slice(0, 8)} required by the start-point.`,
+    );
+  }
+}
+
+function worktreeUsingBranch(repository, branch) {
+  const result = gitText(repository.directory, ["worktree", "list", "--porcelain"]);
+  const expected = `branch refs/heads/${branch}`;
+  for (const record of result.stdout.split(/\n\n+/)) {
+    const lines = record.split("\n");
+    const worktree = lines.find((line) => line.startsWith("worktree "));
+    if (!worktree || !lines.includes(expected)) continue;
+    const directory = canonicalPath(worktree.slice("worktree ".length));
+    if (directory !== canonicalPath(repository.directory)) return directory;
+  }
+  return null;
+}
+
+function planRepositoryAtStartPoint(
+  context,
+  repository,
+  coordinatorBranch,
+  desiredRevision,
+) {
+  const branch = resolvedRepositoryBranch(repository, coordinatorBranch);
+  validateBranchName(branch);
+  assertCommitAvailable(repository, desiredRevision);
+
+  if (repository.branchPolicy.mode === "pinned") {
+    const state = repositoryState(repository.directory);
+    if (state.branch === branch && state.revision === desiredRevision) {
+      return { branch, created: false, detached: false, desiredRevision };
+    }
+    if (
+      !branchContainsRevision(
+        context,
+        repository,
+        branch,
+        desiredRevision,
+      )
+    ) {
+      throw new CoordinatedGitError(
+        `${repository.id} pinned gitlink ${desiredRevision.slice(0, 8)} is not reachable from '${branch}'.`,
+      );
+    }
+    return { branch, created: false, detached: true, desiredRevision };
+  }
+
+  if (branchExists(repository.directory, branch)) {
+    const branchRevision = gitText(repository.directory, [
+      "rev-parse",
+      `refs/heads/${branch}`,
+    ]).stdout;
+    if (branchRevision !== desiredRevision) {
+      throw new CoordinatedGitError(
+        `${repository.id} branch '${branch}' is at ${branchRevision.slice(0, 8)}, expected gitlink ${desiredRevision.slice(0, 8)}.`,
+      );
+    }
+    const occupiedBy = worktreeUsingBranch(repository, branch);
+    if (occupiedBy) {
+      throw new CoordinatedGitError(
+        `${repository.id} branch '${branch}' is already checked out at ${occupiedBy}.`,
+      );
+    }
+    return { branch, created: false, detached: false, desiredRevision };
+  }
+
+  return { branch, created: true, detached: false, desiredRevision };
+}
+
+function creationManifestFromValue(context, coordinatorBranch, manifest) {
+  if (!context.workspaceManifest) return null;
+  const nextManifest = JSON.parse(JSON.stringify(manifest));
+  const configured = configuredPolicyContext(context);
+  for (const repository of configured.repositories) {
+    const policy = repository.branchPolicy;
+    const branch =
+      policy.mode === "mirror"
+        ? context.workspaceManifest.coordinatorToken
+        : resolvedRepositoryBranch(repository, coordinatorBranch);
+    nextManifest.repositories[repository.id] = {
+      path: repository.path,
+      branch,
+      mode: policy.readOnly ? "pinned" : "active",
+    };
+  }
+  return nextManifest;
+}
+
+function fileState(file) {
+  return existsSync(file)
+    ? { contents: readFileSync(file, "utf8"), exists: true }
+    : { exists: false };
+}
+
+function restoreFileState(file, state) {
+  if (state.exists) {
+    writeFileSync(file, state.contents, { mode: 0o644 });
+  } else if (existsSync(file)) {
+    unlinkSync(file);
+  }
+}
+
+function createCoordinatedBranchAtStartPoint(context, branch, startPoint) {
+  validateBranchName(branch);
+  const currentContext = currentPolicyContext(context);
+  assertFullInvariant(currentContext);
+  assertCleanWorkspaceBranchChange(currentContext);
+
+  const startRevision = resolveStartPointCommit(context, startPoint);
+  const targetConfiguration = loadContext(context, { revision: startRevision });
+  if (!targetConfiguration) {
+    throw new CoordinatedGitError(
+      `start-point '${startPoint}' does not contain an interpretable coordinator configuration.`,
+    );
+  }
+  assertInitializedRepositories(currentContext);
+  assertInitializedRepositories(targetConfiguration);
+  assertRepositoriesClean([currentContext, targetConfiguration]);
+
+  const targetContext = targetConfiguration.workspaceManifest
+    ? manifestPolicyContext(targetConfiguration, branch, {
+        revision: startRevision,
+      })
+    : configuredPolicyContext(targetConfiguration);
+  if (branchExists(context.rootDirectory, branch)) {
+    throw new CoordinatedGitError(
+      `branch '${branch}' already exists in the coordinator.`,
+    );
+  }
+
+  const repositoryPlans = targetContext.repositories.map((repository) => {
+    const desiredRevision = rootGitlinkRevision(
+      targetContext,
+      repository,
+      startRevision,
+    );
+    return {
+      repository,
+      prepared: planRepositoryAtStartPoint(
+        targetContext,
+        repository,
+        branch,
+        desiredRevision,
+      ),
+    };
+  });
+  const nextManifest = targetConfiguration.workspaceManifest
+    ? creationManifestFromValue(
+        targetConfiguration,
+        branch,
+        targetContext.workspaceManifestValue,
+      )
+    : null;
+  const manifestState = targetConfiguration.workspaceManifest
+    ? fileState(targetConfiguration.workspaceManifest.absolutePath)
+    : null;
+  const states = [
+    ...targetContext.repositories.map((repository) => ({
+      repository: repository.directory,
+      state: repositoryState(repository.directory),
+    })),
+    {
+      repository: context.rootDirectory,
+      state: repositoryState(context.rootDirectory),
+    },
+  ];
+  const createdBranches = [];
+  let manifestWritten = false;
+
+  try {
+    const rootResult = executeGit(context.rootDirectory, [
+      "branch",
+      branch,
+      startRevision,
+    ]);
+    if (rootResult.status !== 0) {
+      throw new CoordinatedGitError(
+        `could not create '${branch}' in the coordinator at ${startRevision.slice(0, 8)}.`,
+      );
+    }
+    createdBranches.push({ repository: context.rootDirectory, branch });
+
+    for (const { repository, prepared } of repositoryPlans) {
+      if (!prepared.created) continue;
+      const result = executeGit(repository.directory, [
+        "branch",
+        prepared.branch,
+        prepared.desiredRevision,
+      ]);
+      if (result.status !== 0) {
+        throw new CoordinatedGitError(
+          `could not create '${prepared.branch}' in ${repository.id}.`,
+        );
+      }
+      createdBranches.push({
+        repository: repository.directory,
+        branch: prepared.branch,
+      });
+    }
+
+    for (const { repository, prepared } of repositoryPlans) {
+      if (prepared.detached) {
+        switchRepositoryDetached(repository.directory, prepared.desiredRevision);
+      } else {
+        switchRepository(repository.directory, prepared.branch);
+        if (prepared.created) {
+          setUpstreamFromRemote(targetContext, repository, prepared.branch);
+        }
+      }
+    }
+    switchRepository(context.rootDirectory, branch);
+    if (nextManifest) {
+      writeWorkspaceManifest(targetConfiguration, nextManifest);
+      manifestWritten = true;
+    }
+
+    const effectiveContext = loadContext(context);
+    if (!effectiveContext) {
+      throw new CoordinatedGitError(
+        "coordinator configuration disappeared after creating the branch.",
+      );
+    }
+    const effectivePolicyContext = currentPolicyContext(effectiveContext);
+    assertFullInvariant(effectivePolicyContext);
+    assertReadOnlyRepositoriesClean(effectivePolicyContext);
+    process.stderr.write(
+      `[agent-coordinator] created '${branch}' from ${startPoint} (${startRevision.slice(0, 8)}): ${branchMappingSummary(effectivePolicyContext, branch)}.\n`,
+    );
+    return 0;
+  } catch (error) {
+    if (manifestWritten) {
+      restoreFileState(
+        targetConfiguration.workspaceManifest.absolutePath,
+        manifestState,
+      );
+    }
+    rollbackRepositories(states, createdBranches);
+    throw error;
+  }
+}
+
 function switchCoordinatedBranch(context, branch) {
   validateBranchName(branch);
   context = currentPolicyContext(context);
@@ -2265,10 +2556,19 @@ function coordinatedCheckout(context) {
   }
   if (createFlagIndex >= 0) {
     const branch = argumentsList[createFlagIndex + 1];
-    if (!branch || argumentsList.length !== 2) {
+    const startPoint = argumentsList[createFlagIndex + 2];
+    if (
+      createFlagIndex !== 0 ||
+      !branch ||
+      argumentsList.length < 2 ||
+      argumentsList.length > 3
+    ) {
       throw new CoordinatedGitError(
-        `coordinated ${context.command} branch creation supports only '${context.command} ${argumentsList[createFlagIndex]} <branch>'.`,
+        `coordinated ${context.command} branch creation supports only '${context.command} ${argumentsList[createFlagIndex]} <branch> [<start-point>]'.`,
       );
+    }
+    if (startPoint) {
+      return createCoordinatedBranchAtStartPoint(context, branch, startPoint);
     }
     return createCoordinatedBranch(context, branch);
   }

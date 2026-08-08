@@ -370,6 +370,8 @@ git pull
 git push
 git checkout main
 git checkout -b feature/new-work
+git checkout -b hotfix/urgent origin/main
+git switch -c hotfix/urgent origin/main
 git worktree add ../new-worktree
 ```
 
@@ -377,6 +379,13 @@ Agent Coordinator applies the operation to writable children according to
 their branch policies, updates root gitlinks, and delegates unrelated Git
 commands to the real Git executable. Outside a configured workspace, Git
 behaves normally.
+
+Coordinated branch creation accepts `git checkout -b <branch> [<start-point>]`
+and `git switch -c <branch> [<start-point>]`. When a start-point is supplied,
+the wrapper resolves it to a commit before changing anything, reads the
+configuration and workspace selection from that revision, and creates each
+child branch (or pinned detached checkout) at that revision's gitlink. The
+workspace must be clean; `-B` and `-C` remain intentionally blocked.
 
 ### Branch policies
 

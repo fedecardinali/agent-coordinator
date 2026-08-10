@@ -645,7 +645,7 @@ program
 
 program
   .command("update")
-  .description("check for or install the latest private release")
+  .description("check for or install the latest published release")
   .option("--apply", "install the latest release")
   .action((options: { apply?: boolean }) => {
     const status = checkForUpdate(VERSION);

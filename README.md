@@ -30,7 +30,7 @@ skills, and coordinated GitHub Actions workflows.
 > One manifest in. Tool-specific configuration out. Ordinary Git stays
 > ordinary.
 
-Agent Coordinator is currently an early-stage private CLI. Its core is
+Agent Coordinator is currently an early-stage open-source CLI. Its core is
 terminal-first: commands remain scriptable, while interactive setup and status
 use a styled terminal interface built with
 [Clack](https://bomb.sh/docs/clack/basics/getting-started/).
@@ -75,7 +75,7 @@ flatten repositories or erase their independent histories.
 - Node.js 20.12 or newer
 - Git
 - [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login` for
-  the GitHub repository picker and private release updates
+  the GitHub repository picker and release updates
 - For the Bitbucket Cloud picker, an Atlassian account email and
   [scoped API token](https://support.atlassian.com/bitbucket-cloud/docs/using-api-tokens/),
   supplied interactively or as `BITBUCKET_EMAIL` and
@@ -106,7 +106,7 @@ coordinator --version
 ```
 
 With GitHub CLI configured as Git's credential helper, a direct global
-installation from the private repository is also supported:
+installation from the public repository is also supported:
 
 ```sh
 gh auth setup-git
@@ -628,7 +628,7 @@ generated-file, or Git-runtime invariants fail the command.
 
 ## Updates
 
-Check the latest private GitHub release:
+Check the latest GitHub release:
 
 ```sh
 coordinator update
@@ -646,7 +646,7 @@ same release; it does not rewrite workspace manifests or generated files. Run
 `coordinator sync --check` afterward to see whether the new CLI would change
 generated outputs.
 
-If no private release has been published yet, the command reports that no
+If no release has been published yet, the command reports that no
 release is available.
 
 ## Migrating an existing legacy workspace
@@ -719,7 +719,7 @@ need `--force`.
 | `coordinator compose [args...]` | Run Docker Compose from `local.compose`, forwarding all remaining arguments. |
 | `coordinator install` | Install or refresh the embedded machine-wide Git runtime. |
 | `coordinator uninstall` | Remove only the managed machine-wide Git runtime. |
-| `coordinator update [--apply]` | Check or explicitly apply the latest private release. |
+| `coordinator update [--apply]` | Check or explicitly apply the latest published release. |
 | `coordinator migrate [directory] [--write] [--adopt-git]` | Preview or write a manifest from legacy Git configuration, optionally removing safely absorbed legacy files. |
 | `coordinator demo` | Render deterministic sample status used by documentation assets. |
 
@@ -816,7 +816,7 @@ vhs docs/demo.tape
 
 The package version and tag are one contract. After `npm run check`, create and
 push `v<package-version>`. The tag workflow verifies the complete suite, builds
-the installable archive, and creates or refreshes the private GitHub release.
+the installable archive, and creates or refreshes the public GitHub release.
 `coordinator update` installs that exact validated tag rather than a moving
 branch.
 
@@ -831,7 +831,7 @@ src/ci/          embedded deployment runtime and GitHub Actions generation
 src/hosting/     Git hosting discovery adapters
 src/status/      workspace inspection
 src/doctor/      health checks
-src/update/      private release checks and explicit updates
+src/update/      published release checks and explicit updates
 src/ui/          Clack prompts and deterministic dashboard rendering
 templates/       generated deployment planner runtime
 test/            current automated contracts

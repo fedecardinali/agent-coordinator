@@ -4384,9 +4384,27 @@ async function promptDashboardAction() {
 var package_default = {
   name: "agent-coordinator",
   version: "0.4.2",
-  private: true,
   description: "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   type: "module",
+  repository: {
+    type: "git",
+    url: "https://github.com/fedecardinali/agent-coordinator.git"
+  },
+  homepage: "https://github.com/fedecardinali/agent-coordinator#readme",
+  bugs: {
+    url: "https://github.com/fedecardinali/agent-coordinator/issues"
+  },
+  keywords: [
+    "git",
+    "monorepo",
+    "multi-repository",
+    "coding-agents",
+    "developer-tools",
+    "cli"
+  ],
+  publishConfig: {
+    access: "public"
+  },
   bin: {
     coordinator: "./dist/cli.js"
   },
@@ -4488,7 +4506,7 @@ function commandFailure(result2) {
 }
 function checkForUpdate(current) {
   if (!commandAvailable("gh")) {
-    throw new CoordinatorError("GitHub CLI is required to check private releases.");
+    throw new CoordinatorError("GitHub CLI is required to check published releases.");
   }
   const authentication = runCommand(
     "gh",
@@ -4508,7 +4526,7 @@ function checkForUpdate(current) {
   );
   if (repository.status !== 0) {
     throw new CoordinatorError(
-      `Cannot access private update repository '${PROJECT_REPOSITORY}': ${commandFailure(repository)}.`,
+      `Cannot access update repository '${PROJECT_REPOSITORY}': ${commandFailure(repository)}.`,
       "UPDATE_REPOSITORY_UNAVAILABLE"
     );
   }
@@ -4529,7 +4547,7 @@ ${result2.stdout}`)) {
       };
     }
     throw new CoordinatorError(
-      `Could not check private releases for '${PROJECT_REPOSITORY}': ${commandFailure(result2)}.`,
+      `Could not check releases for '${PROJECT_REPOSITORY}': ${commandFailure(result2)}.`,
       "UPDATE_CHECK_FAILED"
     );
   }
@@ -6450,7 +6468,7 @@ program.command("uninstall").description("remove the managed transparent Git run
   });
   if (json) writeJson(result2);
 });
-program.command("update").description("check for or install the latest private release").option("--apply", "install the latest release").action((options) => {
+program.command("update").description("check for or install the latest published release").option("--apply", "install the latest release").action((options) => {
   const status = checkForUpdate(VERSION);
   let applied = false;
   if (options.apply && status.tag && status.updateAvailable) {

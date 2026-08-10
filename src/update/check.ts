@@ -77,7 +77,7 @@ function commandFailure(result: CommandResult): string {
 
 export function checkForUpdate(current: string): UpdateStatus {
   if (!commandAvailable("gh")) {
-    throw new CoordinatorError("GitHub CLI is required to check private releases.");
+    throw new CoordinatorError("GitHub CLI is required to check published releases.");
   }
   const authentication = runCommand(
     "gh",
@@ -97,7 +97,7 @@ export function checkForUpdate(current: string): UpdateStatus {
   );
   if (repository.status !== 0) {
     throw new CoordinatorError(
-      `Cannot access private update repository '${PROJECT_REPOSITORY}': ${commandFailure(repository)}.`,
+      `Cannot access update repository '${PROJECT_REPOSITORY}': ${commandFailure(repository)}.`,
       "UPDATE_REPOSITORY_UNAVAILABLE",
     );
   }
@@ -117,7 +117,7 @@ export function checkForUpdate(current: string): UpdateStatus {
       };
     }
     throw new CoordinatorError(
-      `Could not check private releases for '${PROJECT_REPOSITORY}': ${commandFailure(result)}.`,
+      `Could not check releases for '${PROJECT_REPOSITORY}': ${commandFailure(result)}.`,
       "UPDATE_CHECK_FAILED",
     );
   }

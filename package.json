@@ -1,9 +1,27 @@
 {
   "name": "agent-coordinator",
   "version": "0.4.2",
-  "private": true,
   "description": "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fedecardinali/agent-coordinator.git"
+  },
+  "homepage": "https://github.com/fedecardinali/agent-coordinator#readme",
+  "bugs": {
+    "url": "https://github.com/fedecardinali/agent-coordinator/issues"
+  },
+  "keywords": [
+    "git",
+    "monorepo",
+    "multi-repository",
+    "coding-agents",
+    "developer-tools",
+    "cli"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "coordinator": "./dist/cli.js"
   },

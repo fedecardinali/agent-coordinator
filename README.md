@@ -111,7 +111,7 @@ installation from the public repository is also supported:
 ```sh
 gh auth setup-git
 npm install --global \
-  git+https://github.com/fedecardinali/agent-coordinator.git#v0.4.3
+  git+https://github.com/fedecardinali/agent-coordinator.git#v0.4.4
 ```
 
 ### Install the transparent Git runtime
@@ -415,6 +415,20 @@ every repository. That selection is versioned with each coordinator branch:
 repositories stay read-only at their gitlink. `$coordinator` resolves to the
 current coordinator branch. Legacy schema version 1 manifests with an external
 `workspaceManifest` remain readable during migration.
+
+A pinned branch name describes the allowed local branch lineage; the gitlink
+still records one exact commit. When interactive `git checkout -b` finds that a
+pinned repository's local branch has advanced beyond its gitlink, it asks
+whether to advance the new coordinator branch's pin, keep the historical
+gitlink detached, or cancel without changes. Advancing never fetches: it uses
+the current local branch tip, switches the child to that branch, and stages the
+updated gitlink for the next coordinator commit. For explicit noninteractive
+automation, apply one choice to every divergent pin:
+
+```sh
+AGENT_COORDINATOR_PINNED_RESOLUTION=advance git checkout -b feature/example
+AGENT_COORDINATOR_PINNED_RESOLUTION=detach git checkout -b feature/historical
+```
 
 Useful runtime commands are deliberately explicit:
 

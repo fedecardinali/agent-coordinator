@@ -238,11 +238,32 @@ function coordinated(repository, ...argumentsList) {
   });
 }
 
+function coordinatedWithEnvironment(repository, env, ...argumentsList) {
+  const invocation = wrapperInvocation(argumentsList);
+  return run(invocation.command, invocation.argumentsList, {
+    cwd: repository,
+    env,
+  });
+}
+
 function coordinatedAllowFailure(repository, ...argumentsList) {
   const invocation = wrapperInvocation(argumentsList);
   return run(invocation.command, invocation.argumentsList, {
     allowFailure: true,
     cwd: repository,
+  });
+}
+
+function coordinatedAllowFailureWithEnvironment(
+  repository,
+  env,
+  ...argumentsList
+) {
+  const invocation = wrapperInvocation(argumentsList);
+  return run(invocation.command, invocation.argumentsList, {
+    allowFailure: true,
+    cwd: repository,
+    env,
   });
 }
 
@@ -745,7 +766,7 @@ test("v2 mirror and fixed policies coordinate different branches", () => {
   assert.equal(branch(fixture.frontend), "main");
 });
 
-test("v2 fixed read-only policies detach at historical gitlinks during branch creation", () => {
+function historicalPinnedFixture() {
   const configuration = inlineWorkspaceConfiguration();
   configuration.workspace.selection.frontend = {
     branch: "main",
@@ -757,13 +778,106 @@ test("v2 fixed read-only policies detach at historical gitlinks during branch cr
   write(fixture.frontend, "new-main.txt", "new main revision\n");
   git(fixture.frontend, "add", ".");
   git(fixture.frontend, "commit", "--quiet", "-m", "advance frontend main");
+  const branchRevision = revision(fixture.frontend);
   git(fixture.frontend, "switch", "--detach", pinnedRevision);
+  return { branchRevision, fixture, pinnedRevision };
+}
 
-  coordinated(fixture.coordinator, "checkout", "-b", "feature/historical-pin");
+test("v2 fixed read-only divergence requires an explicit noninteractive resolution", () => {
+  const { fixture, pinnedRevision } = historicalPinnedFixture();
+
+  const result = coordinatedAllowFailure(
+    fixture.coordinator,
+    "checkout",
+    "-b",
+    "feature/unresolved-pin",
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /rerun interactively/i);
+  assert.equal(branch(fixture.coordinator), "main");
+  assert.equal(branch(fixture.backend), "main");
+  assert.equal(branch(fixture.frontend), "");
+  assert.equal(revision(fixture.frontend), pinnedRevision);
+  assert.equal(
+    localBranchExists(fixture.coordinator, "feature/unresolved-pin"),
+    false,
+  );
+  assert.equal(
+    localBranchExists(fixture.backend, "feature/unresolved-pin"),
+    false,
+  );
+});
+
+test("v2 fixed read-only policies can keep historical gitlinks detached", () => {
+  const { fixture, pinnedRevision } = historicalPinnedFixture();
+
+  coordinatedWithEnvironment(
+    fixture.coordinator,
+    { AGENT_COORDINATOR_PINNED_RESOLUTION: "detach" },
+    "checkout",
+    "-b",
+    "feature/historical-pin",
+  );
   assert.equal(branch(fixture.coordinator), "feature/historical-pin");
   assert.equal(branch(fixture.backend), "feature/historical-pin");
   assert.equal(branch(fixture.frontend), "");
   assert.equal(revision(fixture.frontend), pinnedRevision);
+});
+
+test("v2 fixed read-only policies can advance and stage the new branch gitlink", () => {
+  const { branchRevision, fixture } = historicalPinnedFixture();
+
+  coordinatedWithEnvironment(
+    fixture.coordinator,
+    { AGENT_COORDINATOR_PINNED_RESOLUTION: "advance" },
+    "checkout",
+    "-b",
+    "feature/advanced-pin",
+  );
+
+  assert.equal(branch(fixture.coordinator), "feature/advanced-pin");
+  assert.equal(branch(fixture.backend), "feature/advanced-pin");
+  assert.equal(branch(fixture.frontend), "main");
+  assert.equal(revision(fixture.frontend), branchRevision);
+  assert.equal(
+    gitText(fixture.coordinator, "rev-parse", ":apps/frontend"),
+    branchRevision,
+  );
+  assert.equal(
+    gitText(fixture.coordinator, "diff", "--cached", "--name-only"),
+    "apps/frontend",
+  );
+  assert.match(
+    coordinated(fixture.coordinator, "--check").stdout,
+    /frontend=main \(read-only\)/,
+  );
+});
+
+test("v2 fixed read-only branch creation can be cancelled without mutations", () => {
+  const { fixture, pinnedRevision } = historicalPinnedFixture();
+  const result = coordinatedAllowFailureWithEnvironment(
+    fixture.coordinator,
+    { AGENT_COORDINATOR_PINNED_RESOLUTION: "cancel" },
+    "checkout",
+    "-b",
+    "feature/cancelled-pin",
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /cancelled/i);
+  assert.equal(branch(fixture.coordinator), "main");
+  assert.equal(branch(fixture.backend), "main");
+  assert.equal(branch(fixture.frontend), "");
+  assert.equal(revision(fixture.frontend), pinnedRevision);
+  assert.equal(
+    localBranchExists(fixture.coordinator, "feature/cancelled-pin"),
+    false,
+  );
+  assert.equal(
+    localBranchExists(fixture.backend, "feature/cancelled-pin"),
+    false,
+  );
 });
 
 test("v2 read-only repositories reject local changes", () => {

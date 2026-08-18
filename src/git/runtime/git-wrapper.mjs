@@ -2071,9 +2071,13 @@ function prepareRepositoryAtRevision(
     { allowFailure: true },
   );
   if (branchRevisionResult.status !== 0) {
-    throw new CoordinatedGitError(
-      `${repository.id} pinned branch '${repositoryBranch}' does not exist locally.`,
-    );
+    return {
+      branch: repositoryBranch,
+      created: false,
+      desiredRevision,
+      detached: true,
+      updateGitlink: false,
+    };
   }
   const branchRevision = branchRevisionResult.stdout;
   if (branchRevision === desiredRevision) {

@@ -2,7 +2,9 @@
 
 import { spawnSync } from "node:child_process";
 import {
+  closeSync,
   existsSync,
+  openSync,
   unlinkSync,
   readFileSync,
   readSync,
@@ -1967,18 +1969,30 @@ function planBranchAtRevision(repository, branch, desiredRevision) {
 }
 
 function readTerminalLine() {
+  let terminal;
+  try {
+    terminal = openSync("/dev/tty", "r");
+  } catch (error) {
+    throw new CoordinatedGitError(
+      `could not open the controlling terminal: ${error.message}`,
+    );
+  }
   const buffer = Buffer.alloc(1);
   let value = "";
-  while (true) {
-    const bytesRead = readSync(process.stdin.fd, buffer, 0, 1, null);
-    if (bytesRead === 0) {
-      throw new CoordinatedGitError(
-        "terminal input closed before a pinned branch resolution was selected.",
-      );
+  try {
+    while (true) {
+      const bytesRead = readSync(terminal, buffer, 0, 1, null);
+      if (bytesRead === 0) {
+        throw new CoordinatedGitError(
+          "terminal input closed before a pinned branch resolution was selected.",
+        );
+      }
+      const character = buffer.toString("utf8", 0, bytesRead);
+      if (character === "\n") return value.trim().toLowerCase();
+      if (character !== "\r") value += character;
     }
-    const character = buffer.toString("utf8", 0, bytesRead);
-    if (character === "\n") return value.trim().toLowerCase();
-    if (character !== "\r") value += character;
+  } finally {
+    closeSync(terminal);
   }
 }
 

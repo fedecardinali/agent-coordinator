@@ -779,8 +779,17 @@ function manifestPolicyContext(
   source = "worktree",
 ) {
   if (!context.workspaceManifest) return context;
-  configuredBranchName(coordinatorBranch, "coordinator branch");
   const manifest = readWorkspaceManifest(context, source);
+  return manifestPolicyContextFromValue(context, coordinatorBranch, manifest);
+}
+
+function manifestPolicyContextFromValue(
+  context,
+  coordinatorBranch,
+  manifest,
+) {
+  if (!context.workspaceManifest) return context;
+  configuredBranchName(coordinatorBranch, "coordinator branch");
   const mirrorActive =
     context.workspaceManifest.mirrorActiveInLinkedWorktrees &&
     isLinkedWorktree(context.rootDirectory);
@@ -2083,7 +2092,9 @@ function createCoordinatedBranch(context, branch) {
   const originalManifest = context.workspaceManifest
     ? readFileSync(context.workspaceManifest.absolutePath, "utf8")
     : null;
-  const creationContext = configuredPolicyContext(context);
+  const creationContext = nextManifest
+    ? manifestPolicyContextFromValue(context, branch, nextManifest)
+    : configuredPolicyContext(context);
   let manifestWritten = false;
   try {
     const preparedRepositories = creationContext.repositories.map(

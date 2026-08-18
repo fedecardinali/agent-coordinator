@@ -111,7 +111,7 @@ installation from the public repository is also supported:
 ```sh
 gh auth setup-git
 npm install --global \
-  git+https://github.com/fedecardinali/agent-coordinator.git#v0.4.2
+  git+https://github.com/fedecardinali/agent-coordinator.git#v0.4.3
 ```
 
 ### Install the transparent Git runtime

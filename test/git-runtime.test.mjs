@@ -745,6 +745,27 @@ test("v2 mirror and fixed policies coordinate different branches", () => {
   assert.equal(branch(fixture.frontend), "main");
 });
 
+test("v2 fixed read-only policies detach at historical gitlinks during branch creation", () => {
+  const configuration = inlineWorkspaceConfiguration();
+  configuration.workspace.selection.frontend = {
+    branch: "main",
+    mode: "pinned",
+  };
+  const fixture = createFixture(configuration, { format: "yaml" });
+  const pinnedRevision = revision(fixture.frontend);
+
+  write(fixture.frontend, "new-main.txt", "new main revision\n");
+  git(fixture.frontend, "add", ".");
+  git(fixture.frontend, "commit", "--quiet", "-m", "advance frontend main");
+  git(fixture.frontend, "switch", "--detach", pinnedRevision);
+
+  coordinated(fixture.coordinator, "checkout", "-b", "feature/historical-pin");
+  assert.equal(branch(fixture.coordinator), "feature/historical-pin");
+  assert.equal(branch(fixture.backend), "feature/historical-pin");
+  assert.equal(branch(fixture.frontend), "");
+  assert.equal(revision(fixture.frontend), pinnedRevision);
+});
+
 test("v2 read-only repositories reject local changes", () => {
   const fixture = createFixture(mixedPolicyConfiguration());
   coordinated(fixture.coordinator, "checkout", "-b", "feature/read-only");

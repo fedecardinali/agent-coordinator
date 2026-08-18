@@ -5,6 +5,7 @@ import {
   existsSync,
   unlinkSync,
   readFileSync,
+  readSync,
   realpathSync,
   writeFileSync,
 } from "node:fs";
@@ -17,6 +18,8 @@ const REAL_GIT =
   "/usr/bin/git";
 const INTERNAL_ENVIRONMENT_VARIABLE = "GIT_COORDINATOR_INTERNAL";
 const LEGACY_INTERNAL_ENVIRONMENT_VARIABLE = "COORDINATED_GIT_INTERNAL";
+const PINNED_RESOLUTION_ENVIRONMENT_VARIABLE =
+  "AGENT_COORDINATOR_PINNED_RESOLUTION";
 const GIT_COORDINATOR_WRAPPER_MARKER = "agent-coordinator-git-wrapper-v1";
 const SUPPORTED_COMMANDS = new Set([
   "add",
@@ -1926,19 +1929,8 @@ function prepareBranchAtRevision(
   desiredRevision,
   createdBranches,
 ) {
-  validateBranchName(branch);
-  if (branchExists(repository.directory, branch)) {
-    const branchRevision = gitText(repository.directory, [
-      "rev-parse",
-      `refs/heads/${branch}`,
-    ]).stdout;
-    if (branchRevision !== desiredRevision) {
-      throw new CoordinatedGitError(
-        `${repository.id} branch '${branch}' is at ${branchRevision.slice(0, 8)}, expected gitlink ${desiredRevision.slice(0, 8)}.`,
-      );
-    }
-    return false;
-  }
+  const created = planBranchAtRevision(repository, branch, desiredRevision);
+  if (!created) return false;
 
   const result = executeGit(repository.directory, [
     "branch",
@@ -1957,25 +1949,102 @@ function prepareBranchAtRevision(
   return true;
 }
 
+function planBranchAtRevision(repository, branch, desiredRevision) {
+  validateBranchName(branch);
+  if (branchExists(repository.directory, branch)) {
+    const branchRevision = gitText(repository.directory, [
+      "rev-parse",
+      `refs/heads/${branch}`,
+    ]).stdout;
+    if (branchRevision !== desiredRevision) {
+      throw new CoordinatedGitError(
+        `${repository.id} branch '${branch}' is at ${branchRevision.slice(0, 8)}, expected gitlink ${desiredRevision.slice(0, 8)}.`,
+      );
+    }
+    return false;
+  }
+  return true;
+}
+
+function readTerminalLine() {
+  const buffer = Buffer.alloc(1);
+  let value = "";
+  while (true) {
+    const bytesRead = readSync(process.stdin.fd, buffer, 0, 1, null);
+    if (bytesRead === 0) {
+      throw new CoordinatedGitError(
+        "terminal input closed before a pinned branch resolution was selected.",
+      );
+    }
+    const character = buffer.toString("utf8", 0, bytesRead);
+    if (character === "\n") return value.trim().toLowerCase();
+    if (character !== "\r") value += character;
+  }
+}
+
+function pinnedBranchResolution(
+  repository,
+  branch,
+  pinnedRevision,
+  branchRevision,
+) {
+  const configured = process.env[PINNED_RESOLUTION_ENVIRONMENT_VARIABLE];
+  if (configured) {
+    if (["advance", "detach", "cancel"].includes(configured)) return configured;
+    throw new CoordinatedGitError(
+      `${PINNED_RESOLUTION_ENVIRONMENT_VARIABLE} must be advance, detach, or cancel.`,
+    );
+  }
+
+  if (!process.stdin.isTTY || !process.stderr.isTTY) {
+    throw new CoordinatedGitError(
+      `${repository.id} branch '${branch}' is at ${branchRevision.slice(0, 8)} while the gitlink pins ${pinnedRevision.slice(0, 8)}. Rerun interactively or set ${PINNED_RESOLUTION_ENVIRONMENT_VARIABLE}=advance|detach|cancel.`,
+    );
+  }
+
+  process.stderr.write(
+    `[agent-coordinator] ${repository.id} branch '${branch}' is at ${branchRevision.slice(0, 8)}, while the new branch would pin ${pinnedRevision.slice(0, 8)}.\n` +
+      "  [a] Advance the new branch pin to the current local branch tip\n" +
+      "  [d] Keep the historical gitlink detached\n" +
+      "  [c] Cancel branch creation\n",
+  );
+  while (true) {
+    process.stderr.write("Choose a, d, or c: ");
+    const answer = readTerminalLine();
+    if (answer === "a" || answer === "advance") return "advance";
+    if (answer === "d" || answer === "detach") return "detach";
+    if (answer === "c" || answer === "cancel") return "cancel";
+  }
+}
+
 function prepareRepositoryAtRevision(
   context,
   repository,
   coordinatorBranch,
   desiredRevision,
   createdBranches,
+  options = {},
 ) {
   const repositoryBranch = resolvedRepositoryBranch(
     repository,
     coordinatorBranch,
   );
   if (repository.branchPolicy.mode !== "pinned") {
-    const created = prepareBranchAtRevision(
-      repository,
-      repositoryBranch,
+    const created = options.planOnly
+      ? planBranchAtRevision(repository, repositoryBranch, desiredRevision)
+      : prepareBranchAtRevision(
+          repository,
+          repositoryBranch,
+          desiredRevision,
+          createdBranches,
+        );
+    return {
+      branch: repositoryBranch,
+      created,
       desiredRevision,
-      createdBranches,
-    );
-    return { branch: repositoryBranch, created, detached: false };
+      detached: false,
+      updateGitlink: false,
+    };
   }
 
   validateBranchName(repositoryBranch);
@@ -1988,7 +2057,33 @@ function prepareRepositoryAtRevision(
     checkedOutBranch === repositoryBranch &&
     checkedOutRevision === desiredRevision
   ) {
-    return { branch: repositoryBranch, created: false, detached: false };
+    return {
+      branch: repositoryBranch,
+      created: false,
+      desiredRevision,
+      detached: false,
+      updateGitlink: false,
+    };
+  }
+  const branchRevisionResult = gitText(
+    repository.directory,
+    ["rev-parse", `refs/heads/${repositoryBranch}`],
+    { allowFailure: true },
+  );
+  if (branchRevisionResult.status !== 0) {
+    throw new CoordinatedGitError(
+      `${repository.id} pinned branch '${repositoryBranch}' does not exist locally.`,
+    );
+  }
+  const branchRevision = branchRevisionResult.stdout;
+  if (branchRevision === desiredRevision) {
+    return {
+      branch: repositoryBranch,
+      created: false,
+      desiredRevision,
+      detached: true,
+      updateGitlink: false,
+    };
   }
   if (
     !branchContainsRevision(
@@ -2002,15 +2097,49 @@ function prepareRepositoryAtRevision(
       `${repository.id} pinned gitlink ${desiredRevision.slice(0, 8)} is not reachable from '${repositoryBranch}'.`,
     );
   }
-  return { branch: repositoryBranch, created: false, detached: true };
+  if (!options.resolvePinnedDivergence) {
+    return {
+      branch: repositoryBranch,
+      created: false,
+      desiredRevision,
+      detached: true,
+      updateGitlink: false,
+    };
+  }
+
+  const resolution = pinnedBranchResolution(
+    repository,
+    repositoryBranch,
+    desiredRevision,
+    branchRevision,
+  );
+  if (resolution === "cancel") {
+    throw new CoordinatedGitError(
+      `branch creation cancelled while resolving ${repository.id}.`,
+    );
+  }
+  if (resolution === "advance") {
+    return {
+      branch: repositoryBranch,
+      created: false,
+      desiredRevision: branchRevision,
+      detached: false,
+      previousGitlink: desiredRevision,
+      updateGitlink: true,
+    };
+  }
+  return {
+    branch: repositoryBranch,
+    created: false,
+    desiredRevision,
+    detached: true,
+    updateGitlink: false,
+  };
 }
 
 function checkoutPreparedRepository(context, repository, prepared) {
   if (prepared.detached) {
-    switchRepositoryDetached(
-      repository.directory,
-      rootGitlinkRevision(context, repository),
-    );
+    switchRepositoryDetached(repository.directory, prepared.desiredRevision);
     return;
   }
   switchRepository(repository.directory, prepared.branch);
@@ -2096,8 +2225,9 @@ function createCoordinatedBranch(context, branch) {
     ? manifestPolicyContextFromValue(context, branch, nextManifest)
     : configuredPolicyContext(context);
   let manifestWritten = false;
+  let preparedRepositories = [];
   try {
-    const preparedRepositories = creationContext.repositories.map(
+    preparedRepositories = creationContext.repositories.map(
       (repository) => ({
         repository,
         prepared: prepareRepositoryAtRevision(
@@ -2106,9 +2236,28 @@ function createCoordinatedBranch(context, branch) {
           branch,
           rootGitlinkRevision(creationContext, repository),
           createdBranches,
+          { planOnly: true, resolvePinnedDivergence: true },
         ),
       }),
     );
+
+    for (const { repository, prepared } of preparedRepositories) {
+      if (!prepared.created) continue;
+      const result = executeGit(repository.directory, [
+        "branch",
+        prepared.branch,
+        prepared.desiredRevision,
+      ]);
+      if (result.status !== 0) {
+        throw new CoordinatedGitError(
+          `could not create '${prepared.branch}' in ${repository.id}.`,
+        );
+      }
+      createdBranches.push({
+        repository: repository.directory,
+        branch: prepared.branch,
+      });
+    }
 
     const rootResult = executeGit(context.rootDirectory, ["branch", branch]);
     if (rootResult.status !== 0) {
@@ -2129,19 +2278,58 @@ function createCoordinatedBranch(context, branch) {
       writeWorkspaceManifest(context, nextManifest);
       manifestWritten = true;
     }
+    const advancedRepositories = preparedRepositories.filter(
+      ({ prepared }) => prepared.updateGitlink,
+    );
+    for (const { repository } of advancedRepositories) {
+      const result = executeGit(context.rootDirectory, [
+        "add",
+        "--",
+        repository.path,
+      ]);
+      if (result.status !== 0) {
+        throw new CoordinatedGitError(
+          `could not stage the updated ${repository.id} gitlink.`,
+        );
+      }
+    }
     const effectiveContext = currentPolicyContext(context);
     assertFullInvariant(effectiveContext);
+    if (advancedRepositories.length > 0) {
+      process.stderr.write(
+        `[agent-coordinator] staged updated pinned gitlinks: ${advancedRepositories.map(({ repository }) => repository.id).join(", ")}.\n`,
+      );
+    }
     process.stderr.write(
       `[agent-coordinator] created '${branch}': ${branchMappingSummary(effectiveContext, branch)}.\n`,
     );
     return 0;
   } catch (error) {
+    const gitlinkRollbackFailures = [];
+    for (const { repository, prepared } of preparedRepositories) {
+      if (!prepared.updateGitlink) continue;
+      const result = executeGit(
+        context.rootDirectory,
+        [
+          "update-index",
+          "--cacheinfo",
+          `160000,${prepared.previousGitlink},${repository.path}`,
+        ],
+        { capture: true },
+      );
+      if (result.status !== 0) gitlinkRollbackFailures.push(repository.id);
+    }
     if (manifestWritten) {
       writeFileSync(context.workspaceManifest.absolutePath, originalManifest, {
         mode: 0o644,
       });
     }
     rollbackRepositories(states, createdBranches);
+    if (gitlinkRollbackFailures.length > 0) {
+      process.stderr.write(
+        `[agent-coordinator] WARNING: rollback could not restore staged gitlinks for ${gitlinkRollbackFailures.join(", ")}.\n`,
+      );
+    }
     throw error;
   }
 }

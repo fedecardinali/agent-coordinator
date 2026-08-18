@@ -111,7 +111,7 @@ installation from the public repository is also supported:
 ```sh
 gh auth setup-git
 npm install --global \
-  git+https://github.com/fedecardinali/agent-coordinator.git#v0.4.5
+  git+https://github.com/fedecardinali/agent-coordinator.git#v0.4.6
 ```
 
 ### Install the transparent Git runtime
@@ -419,14 +419,17 @@ current coordinator branch. Legacy schema version 1 manifests with an external
 A pinned branch name describes the allowed local branch lineage; the gitlink
 still records one exact commit. When interactive `git checkout -b` finds that a
 pinned repository's local branch has advanced beyond its gitlink, it asks
-whether to advance the new coordinator branch's pin, keep the historical
-gitlink detached, or cancel without changes. Advancing never fetches: it uses
-the current local branch tip, switches the child to that branch, and stages the
-updated gitlink for the next coordinator commit. For explicit noninteractive
+whether to use the current local branch tip, fetch and pin the latest remote
+branch, keep the historical gitlink detached, or cancel without changes. Local
+advance never fetches: it switches the child to the existing local branch.
+Latest fetches the configured remote, leaves the local branch untouched, and
+detaches the child at the exact fetched commit. Both update choices stage the
+gitlink for the next coordinator commit. For explicit noninteractive
 automation, apply one choice to every divergent pin:
 
 ```sh
 AGENT_COORDINATOR_PINNED_RESOLUTION=advance git checkout -b feature/example
+AGENT_COORDINATOR_PINNED_RESOLUTION=latest git checkout -b feature/latest
 AGENT_COORDINATOR_PINNED_RESOLUTION=detach git checkout -b feature/historical
 ```
 

@@ -854,6 +854,82 @@ test("v2 fixed read-only policies can advance and stage the new branch gitlink",
   );
 });
 
+test("v2 fixed read-only policies can fetch and pin the latest remote branch", () => {
+  const { branchRevision, fixture, pinnedRevision } = historicalPinnedFixture();
+
+  git(fixture.frontend, "switch", "main");
+  git(fixture.frontend, "push", "--quiet", "origin", "main");
+  write(fixture.frontend, "latest-main.txt", "latest remote main revision\n");
+  git(fixture.frontend, "add", ".");
+  git(fixture.frontend, "commit", "--quiet", "-m", "latest remote main");
+  const remoteRevision = revision(fixture.frontend);
+  git(fixture.frontend, "push", "--quiet", "origin", "main");
+  git(fixture.frontend, "switch", "--detach", pinnedRevision);
+  git(fixture.frontend, "branch", "-f", "main", branchRevision);
+
+  coordinatedWithEnvironment(
+    fixture.coordinator,
+    { AGENT_COORDINATOR_PINNED_RESOLUTION: "latest" },
+    "checkout",
+    "-b",
+    "feature/latest-pin",
+  );
+
+  assert.equal(branch(fixture.coordinator), "feature/latest-pin");
+  assert.equal(branch(fixture.backend), "feature/latest-pin");
+  assert.equal(branch(fixture.frontend), "");
+  assert.equal(revision(fixture.frontend), remoteRevision);
+  assert.equal(
+    gitText(fixture.frontend, "rev-parse", "refs/heads/main"),
+    branchRevision,
+  );
+  assert.equal(
+    gitText(fixture.coordinator, "rev-parse", ":apps/frontend"),
+    remoteRevision,
+  );
+  assert.equal(
+    gitText(fixture.coordinator, "diff", "--cached", "--name-only"),
+    "apps/frontend",
+  );
+  assert.equal(
+    gitText(
+      fixture.frontend,
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/agent-coordinator/pinned-resolution",
+    ),
+    "",
+  );
+});
+
+test("v2 latest pinned resolution fails before branch creation when fetch fails", () => {
+  const { fixture, pinnedRevision } = historicalPinnedFixture();
+  git(fixture.frontend, "remote", "remove", "origin");
+
+  const result = coordinatedAllowFailureWithEnvironment(
+    fixture.coordinator,
+    { AGENT_COORDINATOR_PINNED_RESOLUTION: "latest" },
+    "checkout",
+    "-b",
+    "feature/latest-fetch-failure",
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /could not fetch latest origin\/main/i);
+  assert.equal(branch(fixture.coordinator), "main");
+  assert.equal(branch(fixture.backend), "main");
+  assert.equal(branch(fixture.frontend), "");
+  assert.equal(revision(fixture.frontend), pinnedRevision);
+  assert.equal(
+    localBranchExists(fixture.coordinator, "feature/latest-fetch-failure"),
+    false,
+  );
+  assert.equal(
+    localBranchExists(fixture.backend, "feature/latest-fetch-failure"),
+    false,
+  );
+});
+
 test("v2 fixed read-only branch creation can be cancelled without mutations", () => {
   const { fixture, pinnedRevision } = historicalPinnedFixture();
   const result = coordinatedAllowFailureWithEnvironment(

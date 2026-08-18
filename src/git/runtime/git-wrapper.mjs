@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -2004,31 +2005,102 @@ function pinnedBranchResolution(
 ) {
   const configured = process.env[PINNED_RESOLUTION_ENVIRONMENT_VARIABLE];
   if (configured) {
-    if (["advance", "detach", "cancel"].includes(configured)) return configured;
+    if (["advance", "latest", "detach", "cancel"].includes(configured)) {
+      return configured;
+    }
     throw new CoordinatedGitError(
-      `${PINNED_RESOLUTION_ENVIRONMENT_VARIABLE} must be advance, detach, or cancel.`,
+      `${PINNED_RESOLUTION_ENVIRONMENT_VARIABLE} must be advance, latest, detach, or cancel.`,
     );
   }
 
   if (!process.stdin.isTTY || !process.stderr.isTTY) {
     throw new CoordinatedGitError(
-      `${repository.id} branch '${branch}' is at ${branchRevision.slice(0, 8)} while the gitlink pins ${pinnedRevision.slice(0, 8)}. Rerun interactively or set ${PINNED_RESOLUTION_ENVIRONMENT_VARIABLE}=advance|detach|cancel.`,
+      `${repository.id} branch '${branch}' is at ${branchRevision.slice(0, 8)} while the gitlink pins ${pinnedRevision.slice(0, 8)}. Rerun interactively or set ${PINNED_RESOLUTION_ENVIRONMENT_VARIABLE}=advance|latest|detach|cancel.`,
     );
   }
 
   process.stderr.write(
     `[agent-coordinator] ${repository.id} branch '${branch}' is at ${branchRevision.slice(0, 8)}, while the new branch would pin ${pinnedRevision.slice(0, 8)}.\n` +
       "  [a] Advance the new branch pin to the current local branch tip\n" +
+      "  [l] Fetch the latest remote branch and update the new branch pin\n" +
       "  [d] Keep the historical gitlink detached\n" +
       "  [c] Cancel branch creation\n",
   );
   while (true) {
-    process.stderr.write("Choose a, d, or c: ");
+    process.stderr.write("Choose a, l, d, or c: ");
     const answer = readTerminalLine();
     if (answer === "a" || answer === "advance") return "advance";
+    if (answer === "l" || answer === "latest") return "latest";
     if (answer === "d" || answer === "detach") return "detach";
     if (answer === "c" || answer === "cancel") return "cancel";
   }
+}
+
+function fetchLatestPinnedRevision(
+  context,
+  repository,
+  branch,
+  pinnedRevision,
+) {
+  const remote = context.configuration.remote || "origin";
+  const temporaryReference =
+    `refs/agent-coordinator/pinned-resolution/${randomUUID()}`;
+  process.stderr.write(
+    `[agent-coordinator] fetching latest ${repository.id}/${branch} from ${remote}...\n`,
+  );
+  let operationError = null;
+  let remoteRevision = null;
+  try {
+    const result = executeGit(repository.directory, [
+      "fetch",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--no-write-fetch-head",
+      "--",
+      remote,
+      `+refs/heads/${branch}:${temporaryReference}`,
+    ]);
+    if (result.status !== 0) {
+      throw new CoordinatedGitError(
+        `could not fetch latest ${remote}/${branch} for ${repository.id}.`,
+      );
+    }
+    remoteRevision = gitText(repository.directory, [
+      "rev-parse",
+      temporaryReference,
+    ]).stdout;
+    if (
+      gitText(
+        repository.directory,
+        ["merge-base", "--is-ancestor", pinnedRevision, remoteRevision],
+        { allowFailure: true },
+      ).status !== 0
+    ) {
+      throw new CoordinatedGitError(
+        `${repository.id} latest ${remote}/${branch} at ${remoteRevision.slice(0, 8)} does not contain pinned gitlink ${pinnedRevision.slice(0, 8)}.`,
+      );
+    }
+  } catch (error) {
+    operationError = error;
+  } finally {
+    const cleanup = executeGit(
+      repository.directory,
+      ["update-ref", "-d", temporaryReference],
+      { capture: true },
+    );
+    if (cleanup.status !== 0) {
+      const cleanupMessage =
+        `could not remove temporary ref ${temporaryReference} in ${repository.id}.`;
+      if (operationError) {
+        throw new CoordinatedGitError(
+          `${operationError.message} Additionally, ${cleanupMessage}`,
+        );
+      }
+      throw new CoordinatedGitError(cleanupMessage);
+    }
+  }
+  if (operationError) throw operationError;
+  return remoteRevision;
 }
 
 function prepareRepositoryAtRevision(
@@ -2144,6 +2216,22 @@ function prepareRepositoryAtRevision(
       detached: false,
       previousGitlink: desiredRevision,
       updateGitlink: true,
+    };
+  }
+  if (resolution === "latest") {
+    const latestRevision = fetchLatestPinnedRevision(
+      context,
+      repository,
+      repositoryBranch,
+      desiredRevision,
+    );
+    return {
+      branch: repositoryBranch,
+      created: false,
+      desiredRevision: latestRevision,
+      detached: true,
+      previousGitlink: desiredRevision,
+      updateGitlink: latestRevision !== desiredRevision,
     };
   }
   return {

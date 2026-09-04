@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.ts
-import path16 from "path";
+import path17 from "path";
 import { Command, CommanderError } from "commander";
 import pc3 from "picocolors";
 
@@ -3306,6 +3306,58 @@ function invokeGitRuntime(mode, directory = process.cwd(), options = {}) {
   }
   return execution2;
 }
+function parseRecoveryReport(execution2) {
+  try {
+    const report = JSON.parse(execution2.stdout);
+    if (report?.schemaVersion !== 1 || report.owner !== "Agent Coordinator" || !Array.isArray(report.issues) || !Array.isArray(report.plans)) {
+      throw new Error("unsupported recovery report");
+    }
+    return report;
+  } catch {
+    throw new CoordinatorError(
+      `Git recovery returned invalid output: ${execution2.stdout || execution2.stderr || "empty output"}`,
+      "INVALID_GIT_RECOVERY_REPORT"
+    );
+  }
+}
+function inspectGitRecovery(directory = process.cwd(), options = {}) {
+  const environment = environmentFor(options);
+  const execution2 = runCommand(process.execPath, [
+    embeddedGitRuntimeSourcePath(environment),
+    "--diagnose"
+  ], {
+    allowFailure: true,
+    cwd: path8.resolve(directory),
+    env: environment
+  });
+  if (execution2.status !== 0) {
+    throw new CoordinatorError(
+      `Git recovery diagnosis failed: ${execution2.stderr || execution2.stdout || `exit ${execution2.status}`}`,
+      "GIT_RECOVERY_DIAGNOSIS_FAILED"
+    );
+  }
+  return parseRecoveryReport(execution2);
+}
+function applyGitRecovery(directory, strategy, snapshot, options = {}) {
+  const environment = environmentFor(options);
+  const execution2 = runCommand(process.execPath, [
+    embeddedGitRuntimeSourcePath(environment),
+    "--recover",
+    strategy,
+    snapshot
+  ], {
+    allowFailure: true,
+    cwd: path8.resolve(directory),
+    env: environment
+  });
+  if (execution2.status !== 0) {
+    throw new CoordinatorError(
+      `Git recovery failed: ${execution2.stderr || execution2.stdout || `exit ${execution2.status}`}`,
+      "GIT_RECOVERY_FAILED"
+    );
+  }
+  return parseRecoveryReport(execution2);
+}
 function yamlNativeGitRuntimeActive(root) {
   const environment = process.env;
   const configured = git(
@@ -3970,6 +4022,49 @@ function value(input) {
   }
   return input;
 }
+function reportGitRecovery(report) {
+  const lines = [];
+  if (report.lastFailure) {
+    lines.push(
+      `Last failure: ${report.lastFailure.operation} \xB7 ${report.lastFailure.code} \xB7 ${report.lastFailure.at}`
+    );
+  }
+  if (report.issues.length === 0) lines.push("No Git coordination problems detected.");
+  for (const issue of report.issues) {
+    lines.push(`[${issue.code}] ${issue.repository}: ${issue.message}`);
+    for (const command of issue.commands) lines.push(`  \u2192 ${command}`);
+  }
+  for (const plan of report.plans.filter((entry) => !entry.available && entry.steps.length)) {
+    lines.push(`${plan.label} is unavailable: ${plan.blocked.join(" ")}`);
+  }
+  note(lines.join("\n"), "Git recovery diagnosis");
+}
+async function promptGitRecovery(report) {
+  reportGitRecovery(report);
+  const available = report.plans.filter((plan2) => plan2.available);
+  if (available.length === 0) return null;
+  const strategy = value(
+    await select({
+      message: "Choose a recovery plan",
+      options: [
+        ...available.map((plan2) => ({
+          value: plan2.strategy,
+          label: plan2.label,
+          hint: `${plan2.steps.length} change${plan2.steps.length === 1 ? "" : "s"}`
+        })),
+        { value: "cancel", label: "Exit without changes" }
+      ]
+    })
+  );
+  if (strategy === "cancel") return null;
+  const plan = available.find((entry) => entry.strategy === strategy);
+  note(plan.steps.map((step) => `\u2022 ${step.description}`).join("\n"), "Recovery preview");
+  const accepted = value(await confirm({
+    message: "Apply this recovery plan?",
+    initialValue: false
+  }));
+  return accepted ? plan : null;
+}
 function slug(input) {
   return input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
@@ -4383,7 +4478,7 @@ async function promptDashboardAction() {
 // package.json
 var package_default = {
   name: "agent-coordinator",
-  version: "0.4.6",
+  version: "0.5.0",
   description: "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   type: "module",
   repository: {
@@ -4591,20 +4686,267 @@ function applyUpdate(tag, options = {}) {
   return result2;
 }
 
+// src/update/daily.ts
+import { randomUUID as randomUUID3 } from "crypto";
+import {
+  closeSync as closeSync2,
+  lstatSync as lstatSync4,
+  mkdirSync as mkdirSync4,
+  openSync as openSync2,
+  readFileSync as readFileSync9,
+  renameSync as renameSync4,
+  unlinkSync as unlinkSync3,
+  writeFileSync as writeFileSync4
+} from "fs";
+import path13 from "path";
+import { spawn } from "child_process";
+var CACHE_OWNER = "Agent Coordinator";
+var CACHE_SCHEMA_VERSION = 1;
+var DAILY_UPDATE_TIMEOUT_MS = 3e3;
+function enabledEnvironmentValue(value2) {
+  return Boolean(value2 && value2 !== "0" && value2.toLowerCase() !== "false");
+}
+function shouldCheckForDailyUpdate(context) {
+  if (!context.stdinIsTTY || !context.stdoutIsTTY) return false;
+  if (enabledEnvironmentValue(context.environment.CI)) return false;
+  if (enabledEnvironmentValue(
+    context.environment.AGENT_COORDINATOR_DAILY_UPDATE_CHILD
+  )) {
+    return false;
+  }
+  const excludedOptions = /* @__PURE__ */ new Set([
+    "--json",
+    "--help",
+    "-h",
+    "--version",
+    "-V"
+  ]);
+  if (context.argv.some((argument) => excludedOptions.has(argument))) return false;
+  const excludedModes = /* @__PURE__ */ new Set([
+    "completion",
+    "completions",
+    "install",
+    "recover",
+    "uninstall",
+    "update"
+  ]);
+  return !context.argv.some((argument) => excludedModes.has(argument));
+}
+function dailyUpdateCachePath(environment = process.env) {
+  return path13.join(
+    agentCoordinatorHome(environment),
+    "cache",
+    "daily-update.json"
+  );
+}
+function localDate(now) {
+  const year = String(now.getFullYear()).padStart(4, "0");
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+function cacheState(cachePath, date) {
+  try {
+    const status = lstatSync4(cachePath);
+    if (!status.isFile() || status.isSymbolicLink()) return "unsafe";
+    const parsed = JSON.parse(
+      readFileSync9(cachePath, "utf8")
+    );
+    if (parsed.owner !== CACHE_OWNER || parsed.schemaVersion !== CACHE_SCHEMA_VERSION || typeof parsed.lastAttemptDate !== "string") {
+      return "unsafe";
+    }
+    return parsed.lastAttemptDate === date ? "attempted" : "available";
+  } catch (error) {
+    return error.code === "ENOENT" ? "available" : "unsafe";
+  }
+}
+function recordAttempt(cachePath, date) {
+  const lockPath = `${cachePath}.lock`;
+  const lockToken = randomUUID3();
+  const temporaryPath = path13.join(
+    path13.dirname(cachePath),
+    `.${path13.basename(cachePath)}.${randomUUID3()}`
+  );
+  let lock;
+  try {
+    mkdirSync4(path13.dirname(cachePath), { recursive: true });
+    try {
+      lock = openSync2(lockPath, "wx", 384);
+      writeFileSync4(
+        lock,
+        JSON.stringify({
+          owner: CACHE_OWNER,
+          schemaVersion: CACHE_SCHEMA_VERSION,
+          token: lockToken
+        })
+      );
+    } catch {
+      if (lock !== void 0) {
+        closeSync2(lock);
+        lock = void 0;
+      }
+      return "unavailable";
+    }
+    closeSync2(lock);
+    lock = void 0;
+    const current = cacheState(cachePath, date);
+    if (current === "attempted") return "attempted";
+    if (current === "unsafe") return "unavailable";
+    try {
+      const status = lstatSync4(cachePath);
+      if (!status.isFile() || status.isSymbolicLink()) return "unavailable";
+    } catch (error) {
+      if (error.code !== "ENOENT") return "unavailable";
+    }
+    const cache = {
+      lastAttemptDate: date,
+      owner: CACHE_OWNER,
+      schemaVersion: CACHE_SCHEMA_VERSION
+    };
+    writeFileSync4(temporaryPath, `${JSON.stringify(cache, null, 2)}
+`, {
+      encoding: "utf8",
+      mode: 384
+    });
+    renameSync4(temporaryPath, cachePath);
+    return "recorded";
+  } catch {
+    try {
+      unlinkSync3(temporaryPath);
+    } catch {
+    }
+    return "unavailable";
+  } finally {
+    if (lock !== void 0) closeSync2(lock);
+    try {
+      const parsed = JSON.parse(readFileSync9(lockPath, "utf8"));
+      if (parsed.owner === CACHE_OWNER && parsed.token === lockToken) {
+        unlinkSync3(lockPath);
+      }
+    } catch {
+    }
+  }
+}
+function boundedUpdateCheck(currentVersion, timeoutMs = DAILY_UPDATE_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const entrypoint = process.argv[1];
+    if (!entrypoint) {
+      reject(new Error("Agent Coordinator CLI entrypoint is unavailable."));
+      return;
+    }
+    const nodeArguments = entrypoint.endsWith(".ts") ? ["--import", "tsx", entrypoint, "--json", "update"] : [entrypoint, "--json", "update"];
+    const child = spawn(process.execPath, nodeArguments, {
+      env: {
+        ...process.env,
+        AGENT_COORDINATOR_DAILY_UPDATE_CHILD: "1"
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (operation) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      operation();
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(() => reject(new Error(`Update check exceeded ${timeoutMs}ms.`)));
+    }, timeoutMs);
+    timer.unref();
+    child.stdout?.on("data", (chunk) => {
+      if (stdout.length < 64 * 1024) stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      if (stderr.length < 8 * 1024) stderr += String(chunk);
+    });
+    child.once("error", (error) => finish(() => reject(error)));
+    child.once("close", (code) => {
+      finish(() => {
+        if (code !== 0) {
+          reject(new Error(stderr.trim() || `Update check exited with status ${code}.`));
+          return;
+        }
+        try {
+          const status = JSON.parse(stdout);
+          if (status.current !== currentVersion || typeof status.updateAvailable !== "boolean") {
+            throw new Error("Update check returned an unexpected response.");
+          }
+          resolve(status);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+  });
+}
+async function runDailyUpdatePrompt(options) {
+  const context = options.context ?? {
+    argv: process.argv.slice(2),
+    environment: process.env,
+    stdinIsTTY: Boolean(process.stdin.isTTY),
+    stdoutIsTTY: Boolean(process.stdout.isTTY)
+  };
+  if (!shouldCheckForDailyUpdate(context)) return "skipped";
+  const date = localDate((options.now ?? (() => /* @__PURE__ */ new Date()))());
+  const cachePath = options.cachePath ?? dailyUpdateCachePath(context.environment);
+  const current = cacheState(cachePath, date);
+  if (current === "attempted") return "skipped";
+  if (current === "unsafe") return "cache-unavailable";
+  const recorded = recordAttempt(cachePath, date);
+  if (recorded === "attempted") return "skipped";
+  if (recorded === "unavailable") return "cache-unavailable";
+  let status;
+  try {
+    status = await (options.check ?? boundedUpdateCheck)(
+      options.currentVersion,
+      options.timeoutMs ?? DAILY_UPDATE_TIMEOUT_MS
+    );
+  } catch {
+    return "check-failed";
+  }
+  if (!status.updateAvailable || !status.tag) return "current";
+  let accepted;
+  try {
+    accepted = await options.confirmUpdate(status);
+  } catch {
+    return "declined";
+  }
+  if (!accepted) return "declined";
+  try {
+    (options.apply ?? ((tag) => applyUpdate(tag)))(status.tag);
+    return "applied";
+  } catch {
+    return "apply-failed";
+  }
+}
+
+// src/ui/update.ts
+import { confirm as confirm2, isCancel as isCancel2 } from "@clack/prompts";
+async function promptForDailyUpdate(status) {
+  const answer = await confirm2({
+    message: `Agent Coordinator ${status.latest} is available. Update now?`,
+    initialValue: true
+  });
+  return !isCancel2(answer) && answer;
+}
+
 // src/workspace/initialize.ts
 import {
   existsSync as existsSync11,
-  lstatSync as lstatSync4,
-  mkdirSync as mkdirSync4,
+  lstatSync as lstatSync5,
+  mkdirSync as mkdirSync5,
   readdirSync as readdirSync6,
   realpathSync as realpathSync5
 } from "fs";
-import path14 from "path";
+import path15 from "path";
 
 // src/workspace/nested-repair.ts
 import { createHash as createHash2 } from "crypto";
 import { existsSync as existsSync10, realpathSync as realpathSync4 } from "fs";
-import path13 from "path";
+import path14 from "path";
 var privatePlanState = /* @__PURE__ */ new WeakMap();
 function git2(cwd, argumentsList, allowFailure = false) {
   return runCommand("git", argumentsList, {
@@ -4620,7 +4962,7 @@ function gitDirectory(directory, argumentsList, allowFailure = false) {
   });
 }
 function safeNestedPath(value2) {
-  return Boolean(value2) && value2 !== "." && !/[\x00-\x1f\x7f]/.test(value2) && !path13.isAbsolute(value2) && !value2.split(/[\\/]/).includes("..");
+  return Boolean(value2) && value2 !== "." && !/[\x00-\x1f\x7f]/.test(value2) && !path14.isAbsolute(value2) && !value2.split(/[\\/]/).includes("..");
 }
 function gitlinkRevision(directory, relativePath2) {
   const result2 = git2(
@@ -4708,7 +5050,7 @@ function defaultParentRemoteUrl(directory) {
   return remoteUrl.status === 0 && remoteUrl.stdout ? remoteUrl.stdout.split("\n")[0] : directory;
 }
 function resolveRelativePath(base, relative) {
-  return path13.posix.normalize(
+  return path14.posix.normalize(
     `${base.replace(/\/+$/, "")}/${relative}`
   );
 }
@@ -4731,8 +5073,8 @@ function resolveDeclaredSubmoduleUrl(directory, declaredUrl) {
   if (scp) {
     return `${scp[1]}${resolveRelativePath(scp[2], declaredUrl)}`;
   }
-  const absoluteUpstream = path13.isAbsolute(upstream) ? upstream : path13.resolve(directory, upstream);
-  return path13.resolve(absoluteUpstream, declaredUrl);
+  const absoluteUpstream = path14.isAbsolute(upstream) ? upstream : path14.resolve(directory, upstream);
+  return path14.resolve(absoluteUpstream, declaredUrl);
 }
 function remoteSnapshot(parentDirectory, remoteUrl) {
   const result2 = git2(
@@ -4793,8 +5135,8 @@ function nestedGitDirectory(parentDirectory, nestedName) {
     ["rev-parse", "--git-path", `modules/${nestedName}`],
     true
   );
-  const modulesRoot = path13.resolve(parentDirectory, modulesRootResult.stdout);
-  const resolved = path13.resolve(parentDirectory, result2.stdout);
+  const modulesRoot = path14.resolve(parentDirectory, modulesRootResult.stdout);
+  const resolved = path14.resolve(parentDirectory, result2.stdout);
   if (modulesRootResult.status !== 0 || !modulesRootResult.stdout || result2.status !== 0 || !result2.stdout || !existsSync10(modulesRoot) || !existsSync10(resolved)) {
     throw new CoordinatorError(
       `Automatic nested repair could not inspect the failed clone for '${nestedName}'.`,
@@ -4812,8 +5154,8 @@ function nestedGitDirectory(parentDirectory, nestedName) {
       "NESTED_SUBMODULE_REPAIR_UNAVAILABLE"
     );
   }
-  const relative = path13.relative(canonicalModulesRoot, canonicalResolved);
-  if (!relative || relative.startsWith(`..${path13.sep}`) || relative === ".." || path13.isAbsolute(relative)) {
+  const relative = path14.relative(canonicalModulesRoot, canonicalResolved);
+  if (!relative || relative.startsWith(`..${path14.sep}`) || relative === ".." || path14.isAbsolute(relative)) {
     throw new CoordinatorError(
       "Automatic nested repair refused a submodule cache outside the parent Git modules directory.",
       "NESTED_SUBMODULE_REPAIR_UNAVAILABLE"
@@ -4932,7 +5274,7 @@ function expectedRepositoryBranch(root, repository) {
 }
 function planNestedSubmoduleRepair(rootInput, repository, nestedPath) {
   const canonicalRepository = immutableClone(repository);
-  const root = path13.resolve(rootInput);
+  const root = path14.resolve(rootInput);
   if (canonicalRepository.branch.readOnly) {
     throw new CoordinatorError(
       `Repository '${canonicalRepository.id}' is read-only; Agent Coordinator will not create a repair commit in it.`,
@@ -4945,7 +5287,7 @@ function planNestedSubmoduleRepair(rootInput, repository, nestedPath) {
       "NESTED_SUBMODULE_REPAIR_UNAVAILABLE"
     );
   }
-  const parentDirectory = path13.resolve(root, canonicalRepository.path);
+  const parentDirectory = path14.resolve(root, canonicalRepository.path);
   const parent = requireCleanAttachedParent(parentDirectory);
   const expectedBranch = expectedRepositoryBranch(root, canonicalRepository);
   if (parent.branch !== expectedBranch) {
@@ -5178,7 +5520,7 @@ function applyNestedSubmoduleRepair(plan, options) {
     );
   }
   const commitMessage = validateCommitMessage(
-    options.commitMessage ?? `fix: repair unavailable ${path13.basename(executionPlan.nestedPath)} gitlink`
+    options.commitMessage ?? `fix: repair unavailable ${path14.basename(executionPlan.nestedPath)} gitlink`
   );
   let parentCommitCreated = false;
   let rootGitlinkUpdated = false;
@@ -5199,7 +5541,7 @@ function applyNestedSubmoduleRepair(plan, options) {
       "--",
       executionPlan.nestedPath
     ]);
-    const nestedDirectory = path13.resolve(
+    const nestedDirectory = path14.resolve(
       executionPlan.parentDirectory,
       executionPlan.nestedPath
     );
@@ -5305,7 +5647,7 @@ function git3(root, argumentsList) {
 }
 function pathExists(value2) {
   try {
-    lstatSync4(value2);
+    lstatSync5(value2);
     return true;
   } catch {
     return false;
@@ -5315,19 +5657,19 @@ function canonicalPath2(value2) {
   try {
     return realpathSync5(value2);
   } catch {
-    return path14.resolve(value2);
+    return path15.resolve(value2);
   }
 }
 function isPathWithin(base, candidate) {
-  const relative = path14.relative(base, candidate);
-  return relative === "" || !path14.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path14.sep}`);
+  const relative = path15.relative(base, candidate);
+  return relative === "" || !path15.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path15.sep}`);
 }
 function repositoryUrlsMatch2(expectedInput, actualInput) {
   const expected = repositoryCloneUrl(expectedInput);
   if (parseRepositoryIdentity(expected) || parseRepositoryIdentity(actualInput)) {
     return repositoryUrlsMatch(expected, actualInput);
   }
-  if (path14.isAbsolute(expected) && path14.isAbsolute(actualInput)) {
+  if (path15.isAbsolute(expected) && path15.isAbsolute(actualInput)) {
     return canonicalPath2(expected) === canonicalPath2(actualInput);
   }
   return repositoryUrlsMatch(expected, actualInput);
@@ -5369,18 +5711,18 @@ function configuredSubmodule2(root, repository) {
   return { key, url: url.stdout };
 }
 function validateMaterializedRepository(root, repository) {
-  const absoluteRoot = path14.resolve(root);
-  const repositoryDirectory = path14.resolve(root, repository.path);
+  const absoluteRoot = path15.resolve(root);
+  const repositoryDirectory = path15.resolve(root, repository.path);
   if (!isPathWithin(absoluteRoot, repositoryDirectory)) {
     throw existingRepositoryError(repository, "the destination escapes the coordinator root");
   }
   let cursor = absoluteRoot;
-  for (const segment of path14.relative(absoluteRoot, repositoryDirectory).split(path14.sep)) {
-    cursor = path14.join(cursor, segment);
-    if (pathExists(cursor) && lstatSync4(cursor).isSymbolicLink()) {
+  for (const segment of path15.relative(absoluteRoot, repositoryDirectory).split(path15.sep)) {
+    cursor = path15.join(cursor, segment);
+    if (pathExists(cursor) && lstatSync5(cursor).isSymbolicLink()) {
       throw existingRepositoryError(
         repository,
-        `the destination crosses symbolic link '${path14.relative(absoluteRoot, cursor)}'`
+        `the destination crosses symbolic link '${path15.relative(absoluteRoot, cursor)}'`
       );
     }
   }
@@ -5442,21 +5784,21 @@ function validateMaterializedRepository(root, repository) {
   }
 }
 function nestedCheckoutPath(directory, relativePath2, label) {
-  const parent = path14.resolve(directory);
-  const checkout = path14.resolve(directory, relativePath2);
-  const relative = path14.relative(parent, checkout);
-  if (!relative || path14.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path14.sep}`)) {
+  const parent = path15.resolve(directory);
+  const checkout = path15.resolve(directory, relativePath2);
+  const relative = path15.relative(parent, checkout);
+  if (!relative || path15.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path15.sep}`)) {
     throw new CoordinatorError(
       `${label} has unsafe nested gitlink path '${relativePath2}'.`,
       "NESTED_SUBMODULE_PATH_INVALID"
     );
   }
   let cursor = parent;
-  for (const segment of relative.split(path14.sep)) {
-    cursor = path14.join(cursor, segment);
-    if (pathExists(cursor) && lstatSync4(cursor).isSymbolicLink()) {
+  for (const segment of relative.split(path15.sep)) {
+    cursor = path15.join(cursor, segment);
+    if (pathExists(cursor) && lstatSync5(cursor).isSymbolicLink()) {
       throw new CoordinatorError(
-        `${label} nested gitlink '${relativePath2}' crosses symbolic link '${path14.relative(parent, cursor)}'.`,
+        `${label} nested gitlink '${relativePath2}' crosses symbolic link '${path15.relative(parent, cursor)}'.`,
         "NESTED_SUBMODULE_PATH_INVALID"
       );
     }
@@ -5520,7 +5862,7 @@ function planNestedSubmodules(root, repository) {
       const checkout = nestedCheckoutPath(directory, submodule.path, label);
       const topLevel = gitResult(checkout, ["rev-parse", "--show-toplevel"], true);
       if (topLevel.status !== 0 || !topLevel.stdout || canonicalPath2(topLevel.stdout) !== canonicalPath2(checkout)) {
-        if (pathExists(checkout) && (!lstatSync4(checkout).isDirectory() || readdirSync6(checkout).length > 0)) {
+        if (pathExists(checkout) && (!lstatSync5(checkout).isDirectory() || readdirSync6(checkout).length > 0)) {
           throw new CoordinatorError(
             `${label} nested gitlink '${submodule.path}' is occupied by an unrecognized checkout or files. Init will not overwrite it.`,
             "NESTED_SUBMODULE_PATH_INVALID"
@@ -5565,7 +5907,7 @@ function planNestedSubmodules(root, repository) {
     for (const child of initialized) inspect(child.directory, child.label);
   };
   inspect(
-    path14.join(root, repository.path),
+    path15.join(root, repository.path),
     `Repository '${repository.id}'`
   );
   return plans;
@@ -5602,7 +5944,7 @@ function initializeNestedSubmodules(plans) {
           );
         }
         let repairUnavailable = "";
-        const topLevelParent = path14.join(
+        const topLevelParent = path15.join(
           plan.root,
           plan.repository.path
         );
@@ -5629,7 +5971,7 @@ function initializeNestedSubmodules(plans) {
 }
 function validateExistingDestinations(root, manifest) {
   const existing = manifest.repositories.filter(
-    (repository) => pathExists(path14.join(root, repository.path))
+    (repository) => pathExists(path15.join(root, repository.path))
   );
   if (!existing.length) return;
   const topLevel = gitResult(root, ["rev-parse", "--show-toplevel"], true);
@@ -5644,7 +5986,7 @@ function validateExistingDestinations(root, manifest) {
   }
 }
 function coordinatorBranchForInitialization(root) {
-  if (!pathExists(path14.join(root, ".git"))) return "main";
+  if (!pathExists(path15.join(root, ".git"))) return "main";
   const current = gitResult(
     root,
     ["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -5742,7 +6084,7 @@ function validateNativeConfiguration(root, manifest) {
 }
 function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   const manifest = coordinatorManifestSchema.parse(input);
-  const root = path14.resolve(directory);
+  const root = path15.resolve(directory);
   const dryRun = options.dryRun ?? false;
   const force = options.force ?? false;
   const addSubmodules = options.addSubmodules ?? true;
@@ -5755,7 +6097,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
   if (pathExists(root)) validateExistingDestinations(root, manifest);
   const initialBranches = resolveInitialBranches(root, manifest);
   const initiallyMissing = manifest.repositories.filter(
-    (repository) => !pathExists(path14.join(root, repository.path))
+    (repository) => !pathExists(path15.join(root, repository.path))
   );
   if (!addSubmodules && installHooks && initiallyMissing.length) {
     throw new CoordinatorError(
@@ -5763,18 +6105,18 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
       "SUBMODULES_REQUIRED_FOR_INTEGRATION"
     );
   }
-  if (!existsSync11(root) && !dryRun) mkdirSync4(root, { recursive: true });
-  const gitDirectory2 = path14.join(root, ".git");
+  if (!existsSync11(root) && !dryRun) mkdirSync5(root, { recursive: true });
+  const gitDirectory2 = path15.join(root, ".git");
   const createdGitRepository = !existsSync11(gitDirectory2);
   if (createdGitRepository && !dryRun) {
-    mkdirSync4(root, { recursive: true });
+    mkdirSync5(root, { recursive: true });
     runCommand("git", ["init", "--initial-branch=main", root]);
   }
   if (!dryRun) applyFilePlans([manifestPlan]);
   const added = [];
   if (addSubmodules && !dryRun) {
     for (const repository of manifest.repositories) {
-      const repositoryDirectory = path14.join(root, repository.path);
+      const repositoryDirectory = path15.join(root, repository.path);
       if (pathExists(repositoryDirectory)) continue;
       const initialBranch = initialBranches.get(repository.id);
       const branchArguments = initialBranch.existsOnRemote ? ["-b", initialBranch.name] : [];
@@ -5791,7 +6133,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
     }
   }
   const materialized = manifest.repositories.filter(
-    (repository) => pathExists(path14.join(root, repository.path))
+    (repository) => pathExists(path15.join(root, repository.path))
   );
   for (const repository of materialized) {
     validateMaterializedRepository(root, repository);
@@ -5802,7 +6144,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
     );
     initializeNestedSubmodules(nestedPlans);
   }
-  const missingSubmodules = manifest.repositories.filter((repository) => !pathExists(path14.join(root, repository.path))).map((repository) => repository.id);
+  const missingSubmodules = manifest.repositories.filter((repository) => !pathExists(path15.join(root, repository.path))).map((repository) => repository.id);
   if (!dryRun && installHooks && missingSubmodules.length) {
     throw new CoordinatorError(
       `Cannot install Git integration because these declared submodules are not materialized: ${missingSubmodules.join(", ")}. No hooks, attach, or invariant check were run.`,
@@ -5813,7 +6155,7 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
     for (const repository of manifest.repositories) {
       if (repository.agent.skills.length) continue;
       repository.agent.skills = discoverSkillSources(
-        path14.join(root, repository.path)
+        path15.join(root, repository.path)
       );
     }
     const discoveredManifestPlan = planFile(
@@ -5870,8 +6212,8 @@ function initializeWorkspace(directory, input, generatorVersion, options = {}) {
 }
 
 // src/workspace/migrate.ts
-import { existsSync as existsSync12, readFileSync as readFileSync10 } from "fs";
-import path15 from "path";
+import { existsSync as existsSync12, readFileSync as readFileSync11 } from "fs";
+import path16 from "path";
 function slug2(value2) {
   return value2.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
@@ -5901,10 +6243,10 @@ function inlineWorkspace(root, legacy, repositories) {
   if (!settings || (settings.coordinatorToken ?? "$coordinator") !== "$coordinator") {
     return null;
   }
-  if (typeof settings.path !== "string" || !settings.path || settings.path === "." || path15.isAbsolute(settings.path) || settings.path.split(/[\\/]/).includes("..")) {
+  if (typeof settings.path !== "string" || !settings.path || settings.path === "." || path16.isAbsolute(settings.path) || settings.path.split(/[\\/]/).includes("..")) {
     return null;
   }
-  const normalizedWorkspacePath = path15.posix.normalize(
+  const normalizedWorkspacePath = path16.posix.normalize(
     settings.path.replaceAll("\\", "/")
   );
   if (["coordinator.yaml", ".git-coordinator.json"].includes(
@@ -5915,11 +6257,11 @@ function inlineWorkspace(root, legacy, repositories) {
       "INVALID_LEGACY_CONFIGURATION"
     );
   }
-  const workspacePath = path15.join(root, settings.path);
+  const workspacePath = path16.join(root, settings.path);
   if (!existsSync12(workspacePath)) return null;
   let parsed;
   try {
-    parsed = JSON.parse(readFileSync10(workspacePath, "utf8"));
+    parsed = JSON.parse(readFileSync11(workspacePath, "utf8"));
   } catch {
     return null;
   }
@@ -5956,14 +6298,14 @@ function inlineWorkspace(root, legacy, repositories) {
   };
 }
 function migrateLegacyWorkspaceWithMetadata(rootInput) {
-  const root = path15.resolve(rootInput);
-  const configurationPath = path15.join(root, ".git-coordinator.json");
+  const root = path16.resolve(rootInput);
+  const configurationPath = path16.join(root, ".git-coordinator.json");
   if (!existsSync12(configurationPath)) {
     throw new CoordinatorError(`${configurationPath} does not exist.`);
   }
   let legacy;
   try {
-    legacy = JSON.parse(readFileSync10(configurationPath, "utf8"));
+    legacy = JSON.parse(readFileSync11(configurationPath, "utf8"));
   } catch (error) {
     throw new CoordinatorError(
       `.git-coordinator.json is invalid: ${error instanceof Error ? error.message : String(error)}`
@@ -5977,7 +6319,7 @@ function migrateLegacyWorkspaceWithMetadata(rootInput) {
     [".claude", "claude"],
     [".cursor", "cursor"],
     [".opencode", "opencode"]
-  ].filter(([directory]) => existsSync12(path15.join(root, directory))).map(([, tool]) => tool);
+  ].filter(([directory]) => existsSync12(path16.join(root, directory))).map(([, tool]) => tool);
   const repositories = legacy.repositories.map((repository) => {
     if (!repository.id || !repository.path) {
       throw new CoordinatorError("Legacy repository entry is missing id or path.");
@@ -5993,7 +6335,7 @@ function migrateLegacyWorkspaceWithMetadata(rootInput) {
   const embedded = inlineWorkspace(root, legacy, repositories);
   const manifestInput = {
     schemaVersion: embedded || !legacy.workspaceManifest ? 2 : 1,
-    name: slug2(path15.basename(root)),
+    name: slug2(path16.basename(root)),
     remote: legacy.remote ?? "origin",
     repositories,
     agents: {
@@ -6249,7 +6591,7 @@ program.command("init").description("initialize a coordinator in an empty or exi
   } else {
     manifest = coordinatorManifestSchema.parse({
       schemaVersion: 2,
-      name: options.name ?? slug3(path16.basename(path16.resolve(directory))),
+      name: options.name ?? slug3(path17.basename(path17.resolve(directory))),
       remote: "origin",
       repositories: options.repo.map(repositoryFromSpec),
       agents: {
@@ -6275,7 +6617,7 @@ program.command("init").description("initialize a coordinator in an empty or exi
   const { repairs, result: result2 } = initialized;
   if (options.dryRun) {
     writeJson({
-      directory: path16.resolve(targetDirectory),
+      directory: path17.resolve(targetDirectory),
       manifest,
       discoverSkills,
       repairs,
@@ -6449,6 +6791,76 @@ for (const command of ["install", "uninstall", "attach", "check"]) {
     }
   });
 }
+function printGitRecovery(report, plan) {
+  if (report.lastFailure) {
+    process.stdout.write(
+      `Last coordinated Git failure: ${report.lastFailure.operation} (${report.lastFailure.code}) at ${report.lastFailure.at}.
+`
+    );
+  }
+  if (!report.issues.length) process.stdout.write("No Git coordination problems detected.\n");
+  for (const issue of report.issues) {
+    process.stdout.write(`[${issue.code}] ${issue.repository}: ${issue.message}
+`);
+    for (const command of issue.commands) process.stdout.write(`  Try: ${command}
+`);
+  }
+  const plans = plan ? [plan] : report.plans;
+  for (const candidate of plans) {
+    process.stdout.write(
+      `
+${candidate.label}: ${candidate.available ? "available" : "unavailable"}
+`
+    );
+    for (const step of candidate.steps) process.stdout.write(`  - ${step.description}
+`);
+    for (const reason of candidate.blocked) process.stdout.write(`  Blocked: ${reason}
+`);
+  }
+}
+git4.command("recover").description("diagnose coordinated Git failures and preview safe recovery options").option("--strategy <strategy>", "recovery strategy: align or record").option("--write", "apply the selected recovery plan").option("--dry-run", "print the diagnosis and recovery plan without changes").action(async (options) => {
+  if (options.write && options.dryRun) {
+    throw new CoordinatorError("--write and --dry-run cannot be used together.");
+  }
+  if (options.strategy && !["align", "record"].includes(options.strategy)) {
+    throw new CoordinatorError("--strategy must be 'align' or 'record'.");
+  }
+  if (options.write && !options.strategy && !process.stdin.isTTY) {
+    throw new CoordinatorError("--write requires --strategy outside an interactive terminal.");
+  }
+  const root = findWorkspaceRoot() ?? process.cwd();
+  const diagnosis = inspectGitRecovery(root);
+  const json = globals(program).json;
+  let plan = options.strategy ? diagnosis.plans.find((entry) => entry.strategy === options.strategy) : void 0;
+  if (options.strategy && !plan) throw new CoordinatorError("Recovery plan is unavailable.");
+  if (json || options.dryRun || options.strategy || !process.stdin.isTTY) {
+    if (json) {
+      if (!options.write) {
+        writeJson({ command: "recover", report: diagnosis, selectedPlan: plan ?? null });
+      }
+    } else {
+      printGitRecovery(diagnosis, plan);
+    }
+    if (!options.write) return;
+  } else {
+    plan = await promptGitRecovery(diagnosis) ?? void 0;
+    if (!plan) return;
+  }
+  if (!plan?.available) {
+    throw new CoordinatorError(
+      `Recovery cannot be applied: ${plan?.blocked.join(" ") || "no changes are required."}`,
+      "GIT_RECOVERY_BLOCKED"
+    );
+  }
+  const result2 = applyGitRecovery(root, plan.strategy, diagnosis.snapshot);
+  if (json) writeJson({ command: "recover", report: result2, selectedPlan: plan });
+  else {
+    process.stdout.write(`Applied: ${plan.label}.
+`);
+    for (const next of result2.next ?? []) process.stdout.write(`Next: ${next}
+`);
+  }
+});
 program.command("compose").description("run Docker Compose from the local.compose manifest configuration").argument("[args...]", "arguments forwarded to docker compose").allowUnknownOption(true).allowExcessArguments(true).helpOption(false).action((argumentsList) => {
   const loaded = loadManifest();
   const result2 = runLocalCompose(loaded.root, loaded.manifest, argumentsList);
@@ -6492,7 +6904,7 @@ program.command("update").description("check for or install the latest published
   }
 });
 program.command("migrate").description("create coordinator.yaml from an existing .git-coordinator.json").argument("[directory]", "legacy workspace", ".").option("--write", "write coordinator.yaml instead of printing it").option("--adopt-git", "remove legacy Git files after absorbing their configuration").option("--force", "replace an existing project-owned manifest").action((directory, options) => {
-  const root = path16.resolve(directory);
+  const root = path17.resolve(directory);
   const migration = migrateLegacyWorkspaceWithMetadata(root);
   const manifest = migration.manifest;
   const content = renderManifest(manifest);
@@ -6567,7 +6979,7 @@ function handleCliError(error) {
   }
   process.exitCode = 1;
 }
-var execution = directComposeArguments ? Promise.resolve().then(() => {
+var execution = (directComposeArguments ? Promise.resolve().then(() => {
   const loaded = loadManifest();
   const result2 = runLocalCompose(
     loaded.root,
@@ -6575,6 +6987,19 @@ var execution = directComposeArguments ? Promise.resolve().then(() => {
     directComposeArguments
   );
   if (result2.status !== 0) process.exitCode = result2.status;
-}) : program.parseAsync(process.argv);
+}) : program.parseAsync(process.argv)).then(async () => {
+  if (process.exitCode && process.exitCode !== 0) return;
+  const outcome = await runDailyUpdatePrompt({
+    currentVersion: VERSION,
+    confirmUpdate: promptForDailyUpdate
+  });
+  if (outcome === "applied") {
+    process.stdout.write("Agent Coordinator was updated successfully.\n");
+  } else if (outcome === "apply-failed") {
+    process.stderr.write(
+      "Agent Coordinator could not update. Your original command completed; run 'coordinator update --apply' to see the full error.\n"
+    );
+  }
+});
 execution.catch(handleCliError);
 //# sourceMappingURL=cli.js.map

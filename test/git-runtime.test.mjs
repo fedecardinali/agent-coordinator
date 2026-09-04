@@ -254,6 +254,20 @@ function coordinatedAllowFailure(repository, ...argumentsList) {
   });
 }
 
+function recovery(repository, ...argumentsList) {
+  const invocation = wrapperInvocation(argumentsList);
+  return run(invocation.command, invocation.argumentsList, {
+    allowFailure: true,
+    cwd: repository,
+  });
+}
+
+function recoveryReport(repository) {
+  const result = recovery(repository, "--diagnose");
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout);
+}
+
 function coordinatedAllowFailureWithEnvironment(
   repository,
   env,
@@ -1030,6 +1044,178 @@ test("v2 map policies translate coordinator branches and use a fallback", () => 
   assert.equal(branch(fixture.coordinator), "feature/fallback");
   assert.equal(branch(fixture.backend), "feature/fallback");
   assert.equal(branch(fixture.frontend), "main");
+});
+
+function mappedCheckoutFixture() {
+  const fixture = createFixture(
+    mixedPolicyConfiguration({
+      mode: "map",
+      branches: {
+        main: "feature/backend-api",
+        "feature/coordinator": "feature/backend-insights",
+      },
+      fallback: {
+        mode: "mirror",
+      },
+    }),
+  );
+  const originalGitlink = revision(fixture.backend);
+  git(fixture.backend, "switch", "--quiet", "-c", "feature/backend-api");
+  coordinated(
+    fixture.coordinator,
+    "checkout",
+    "-b",
+    "feature/coordinator",
+  );
+  return { fixture, originalGitlink };
+}
+
+function advanceMappedBranch(fixture) {
+  git(fixture.backend, "switch", "--quiet", "feature/backend-api");
+  write(fixture.backend, "mapped-main.txt", "mapped main advancement\n");
+  git(fixture.backend, "add", "mapped-main.txt");
+  git(fixture.backend, "commit", "--quiet", "-m", "advance mapped main");
+  const advancedRevision = revision(fixture.backend);
+  git(fixture.backend, "switch", "--quiet", "feature/backend-insights");
+  return advancedRevision;
+}
+
+test("checkout preserves advanced mapped branches and stages their target gitlinks", () => {
+  const { fixture, originalGitlink } = mappedCheckoutFixture();
+  const advancedRevision = advanceMappedBranch(fixture);
+
+  const result = coordinated(fixture.coordinator, "checkout", "main");
+
+  assert.equal(branch(fixture.coordinator), "main");
+  assert.equal(branch(fixture.backend), "feature/backend-api");
+  assert.equal(revision(fixture.backend), advancedRevision);
+  assert.equal(
+    gitText(fixture.coordinator, "rev-parse", ":apps/backend"),
+    advancedRevision,
+  );
+  assert.equal(
+    gitText(fixture.coordinator, "rev-parse", "HEAD:apps/backend"),
+    originalGitlink,
+  );
+  assert.equal(
+    gitText(fixture.coordinator, "diff", "--cached", "--name-only"),
+    "apps/backend",
+  );
+  assert.match(result.stderr, /staged updated gitlinks: backend/i);
+  assert.match(
+    coordinated(fixture.coordinator, "--check").stdout,
+    /backend=feature\/backend-api/,
+  );
+});
+
+test("checkout aborts when a mapped branch changes after planning", () => {
+  const { fixture, originalGitlink } = mappedCheckoutFixture();
+  const plannedRevision = advanceMappedBranch(fixture);
+  const hookRevision = gitText(
+    fixture.backend,
+    "commit-tree",
+    `${plannedRevision}^{tree}`,
+    "-p",
+    plannedRevision,
+    "-m",
+    "advance mapped branch from hook",
+  );
+
+  const hooks = path.join(fixture.temporaryDirectory, "move-mapped-branch");
+  const marker = path.join(hooks, "moved");
+  mkdirSync(hooks);
+  writeFileSync(
+    path.join(hooks, "post-checkout"),
+    `#!/bin/sh\nif [ ! -e "${marker}" ]; then\n  touch "${marker}"\n  "${REAL_GIT}" -C "${fixture.backend}" reset --hard ${hookRevision} >/dev/null\nfi\n`,
+    { mode: 0o755 },
+  );
+  git(fixture.coordinator, "config", "core.hooksPath", hooks);
+
+  const result = coordinatedAllowFailure(
+    fixture.coordinator,
+    "checkout",
+    "main",
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /changed after checkout planning/i);
+  assert.equal(branch(fixture.coordinator), "feature/coordinator");
+  assert.equal(branch(fixture.backend), "feature/backend-insights");
+  assert.equal(revision(fixture.backend), originalGitlink);
+  assert.equal(
+    gitText(
+      fixture.backend,
+      "rev-parse",
+      "refs/heads/feature/backend-api",
+    ),
+    hookRevision,
+  );
+  assert.equal(
+    gitText(fixture.coordinator, "rev-parse", ":apps/backend"),
+    originalGitlink,
+  );
+  assert.equal(
+    gitText(fixture.coordinator, "diff", "--cached", "--name-only"),
+    "",
+  );
+});
+
+test("checkout rejects divergent mapped branches without mutation", () => {
+  const { fixture, originalGitlink } = mappedCheckoutFixture();
+
+  const divergentTree = gitText(
+    fixture.backend,
+    "rev-parse",
+    "feature/backend-api^{tree}",
+  );
+  const divergentRevision = gitText(
+    fixture.backend,
+    "commit-tree",
+    divergentTree,
+    "-m",
+    "divergent mapped main",
+  );
+  git(
+    fixture.backend,
+    "update-ref",
+    "refs/heads/feature/backend-api",
+    divergentRevision,
+    originalGitlink,
+  );
+  const coordinatorBranch = branch(fixture.coordinator);
+  const coordinatorRevision = revision(fixture.coordinator);
+  const backendBranch = branch(fixture.backend);
+  const backendRevision = revision(fixture.backend);
+  const indexGitlink = gitText(
+    fixture.coordinator,
+    "rev-parse",
+    ":apps/backend",
+  );
+
+  const result = coordinatedAllowFailure(
+    fixture.coordinator,
+    "checkout",
+    "main",
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /diverged from target gitlink/i);
+  assert.equal(branch(fixture.coordinator), coordinatorBranch);
+  assert.equal(revision(fixture.coordinator), coordinatorRevision);
+  assert.equal(branch(fixture.backend), backendBranch);
+  assert.equal(revision(fixture.backend), backendRevision);
+  assert.equal(
+    gitText(
+      fixture.backend,
+      "rev-parse",
+      "refs/heads/feature/backend-api",
+    ),
+    divergentRevision,
+  );
+  assert.equal(
+    gitText(fixture.coordinator, "rev-parse", ":apps/backend"),
+    indexGitlink,
+  );
 });
 
 test("v2 map policies reject unmapped branches without a fallback", () => {
@@ -1910,4 +2096,354 @@ test("global installer creates and removes stable managed executables", () => {
   assert.equal(existsSync(gitExecutable), false);
   assert.equal(existsSync(cliExecutable), false);
   assert.equal(existsSync(installedRuntime), false);
+});
+
+test("Git recovery previews and records a direct child fast-forward without committing", () => {
+  const fixture = createFixture();
+  const recorded = revision(fixture.backend);
+  const advanced = advanceRemote(
+    fixture,
+    fixture.backendRemote,
+    "main",
+    "recovery-record",
+  );
+  git(fixture.backend, "pull", "--quiet", "--ff-only");
+  const coordinatorRevision = revision(fixture.coordinator);
+
+  const report = recoveryReport(fixture.coordinator);
+  assert.equal(revision(fixture.coordinator), coordinatorRevision);
+  assert.equal(
+    gitText(fixture.coordinator, "rev-parse", ":apps/backend"),
+    recorded,
+  );
+  assert.ok(
+    report.issues.some(
+      (issue) =>
+        issue.code === "GITLINK_MISMATCH" && issue.repository === "backend",
+    ),
+  );
+  const plan = report.plans.find((entry) => entry.strategy === "record");
+  assert.equal(plan.available, true);
+  assert.match(plan.steps[0].description, new RegExp(advanced.slice(0, 8)));
+
+  const applied = recovery(
+    fixture.coordinator,
+    "--recover",
+    "record",
+    report.snapshot,
+  );
+  assert.equal(applied.status, 0, applied.stderr || applied.stdout);
+  const result = JSON.parse(applied.stdout);
+  assert.equal(result.applied, true);
+  assert.equal(result.strategy, "record");
+  assert.equal(revision(fixture.coordinator), coordinatorRevision);
+  assert.equal(
+    gitText(fixture.coordinator, "rev-parse", ":apps/backend"),
+    advanced,
+  );
+  assert.equal(
+    gitText(fixture.coordinator, "diff", "--cached", "--name-only"),
+    "apps/backend",
+  );
+});
+
+test("Git recovery aligns a clean wrong branch but blocks dirty worktrees", () => {
+  const fixture = createFixture();
+  git(fixture.backend, "checkout", "--quiet", "-b", "accidental");
+  const report = recoveryReport(fixture.coordinator);
+  const plan = report.plans.find((entry) => entry.strategy === "align");
+  assert.equal(plan.available, true);
+  assert.ok(
+    report.issues.some(
+      (issue) =>
+        issue.code === "BRANCH_MISMATCH" && issue.repository === "backend",
+    ),
+  );
+
+  const applied = recovery(
+    fixture.coordinator,
+    "--recover",
+    "align",
+    report.snapshot,
+  );
+  assert.equal(applied.status, 0, applied.stderr || applied.stdout);
+  assert.equal(branch(fixture.backend), "main");
+
+  write(fixture.backend, "unfinished.txt", "keep me\n");
+  const dirty = recoveryReport(fixture.coordinator);
+  assert.equal(
+    dirty.plans.find((entry) => entry.strategy === "align").available,
+    false,
+  );
+  const issue = dirty.issues.find(
+    (entry) =>
+      entry.code === "DIRTY_WORKTREE" && entry.repository === "backend",
+  );
+  assert.match(issue.message, /save them/i);
+  assert.ok(issue.commands.some((command) => /stash.*push/.test(command)));
+  assert.equal(
+    readFileSync(path.join(fixture.backend, "unfinished.txt"), "utf8"),
+    "keep me\n",
+  );
+});
+
+test("Git recovery does not hide a removed managed gitlink", () => {
+  const fixture = createFixture();
+  git(
+    fixture.coordinator,
+    "rm",
+    "--cached",
+    "--quiet",
+    "-f",
+    "apps/backend",
+  );
+
+  const report = recoveryReport(fixture.coordinator);
+  assert.ok(
+    report.issues.some(
+      (issue) =>
+        issue.code === "DIRTY_WORKTREE" &&
+        issue.repository === "coordinator",
+    ),
+  );
+  assert.equal(
+    report.plans.find((entry) => entry.strategy === "align").available,
+    false,
+  );
+  assert.equal(
+    report.plans.find((entry) => entry.strategy === "record").available,
+    false,
+  );
+});
+
+test("Git recovery rejects a stale reviewed plan", () => {
+  const fixture = createFixture();
+  const advanced = advanceRemote(
+    fixture,
+    fixture.backendRemote,
+    "main",
+    "recovery-stale",
+  );
+  git(fixture.backend, "pull", "--quiet", "--ff-only");
+  const report = recoveryReport(fixture.coordinator);
+  assert.equal(revision(fixture.backend), advanced);
+  write(fixture.backend, "changed-after-preview.txt", "new state\n");
+
+  const applied = recovery(
+    fixture.coordinator,
+    "--recover",
+    "record",
+    report.snapshot,
+  );
+  assert.notEqual(applied.status, 0);
+  assert.match(applied.stderr, /STALE_RECOVERY_PLAN/);
+  assert.notEqual(
+    gitText(fixture.coordinator, "rev-parse", ":apps/backend"),
+    advanced,
+  );
+});
+
+test("pull rejects an unpublished incoming gitlink before moving any HEAD", () => {
+  const fixture = createFixture();
+  const external = path.join(fixture.temporaryDirectory, "broken-coordinator");
+  run(REAL_GIT, [
+    "clone",
+    "--quiet",
+    "--branch",
+    "main",
+    fixture.coordinatorRemote,
+    external,
+  ]);
+  configureIdentity(external);
+  const unavailable = "1".repeat(40);
+  git(
+    external,
+    "update-index",
+    "--add",
+    "--info-only",
+    "--cacheinfo",
+    `160000,${unavailable},apps/backend`,
+  );
+  git(external, "commit", "--quiet", "-m", "publish broken gitlink");
+  git(external, "push", "--quiet", "origin", "main");
+  const coordinatorRevision = revision(fixture.coordinator);
+  const backendRevision = revision(fixture.backend);
+  const frontendRevision = revision(fixture.frontend);
+
+  const pulled = coordinatedAllowFailure(
+    fixture.coordinator,
+    "pull",
+    "--ff-only",
+  );
+  assert.notEqual(pulled.status, 0);
+  assert.match(pulled.stderr, /MISSING_INCOMING_COMMIT/);
+  assert.match(pulled.stderr, /unpublished or rewritten commit/);
+  assert.equal(revision(fixture.coordinator), coordinatorRevision);
+  assert.equal(revision(fixture.backend), backendRevision);
+  assert.equal(revision(fixture.frontend), frontendRevision);
+  assert.equal(gitText(fixture.coordinator, "status", "--porcelain"), "");
+
+  const report = recoveryReport(fixture.coordinator);
+  assert.equal(report.lastFailure.code, "MISSING_INCOMING_COMMIT");
+  assert.equal(report.lastFailure.operation, "pull");
+  assert.ok(
+    report.issues.some(
+      (issue) =>
+        issue.code === "MISSING_INCOMING_COMMIT" &&
+        issue.repository === "backend",
+    ),
+  );
+});
+
+test("pull validates an incoming branch policy before moving worktrees", () => {
+  const fixture = createFixture(mixedPolicyConfiguration(), { format: "yaml" });
+  const external = path.join(fixture.temporaryDirectory, "changed-policy");
+  run(REAL_GIT, [
+    "clone",
+    "--quiet",
+    "--branch",
+    "main",
+    fixture.coordinatorRemote,
+    external,
+  ]);
+  configureIdentity(external);
+  const manifestPath = path.join(external, "coordinator.yaml");
+  const manifest = parse(readFileSync(manifestPath, "utf8"));
+  manifest.repositories[0].branch = {
+    mode: "fixed",
+    name: "remote-only-policy",
+    readOnly: false,
+  };
+  writeFileSync(manifestPath, stringify(manifest));
+  git(external, "add", "coordinator.yaml");
+  git(external, "commit", "--quiet", "-m", "change child branch policy");
+  git(external, "push", "--quiet", "origin", "main");
+  const before = {
+    coordinator: revision(fixture.coordinator),
+    backend: revision(fixture.backend),
+    frontend: revision(fixture.frontend),
+  };
+
+  const pulled = coordinatedAllowFailure(
+    fixture.coordinator,
+    "pull",
+    "--ff-only",
+  );
+  assert.notEqual(pulled.status, 0);
+  assert.match(pulled.stderr, /INCOMING_CONFIGURATION_CHANGED/);
+  assert.match(pulled.stderr, /No coordinated fast-forward has started/);
+  assert.deepEqual(
+    {
+      coordinator: revision(fixture.coordinator),
+      backend: revision(fixture.backend),
+      frontend: revision(fixture.frontend),
+    },
+    before,
+  );
+});
+
+test("pull rejects a rewritten read-only history before moving worktrees", () => {
+  const fixture = createFixture(mixedPolicyConfiguration(), { format: "yaml" });
+  const rewritten = path.join(fixture.temporaryDirectory, "rewritten-read-only");
+  run(REAL_GIT, [
+    "clone",
+    "--quiet",
+    "--branch",
+    "main",
+    fixture.frontendRemote,
+    rewritten,
+  ]);
+  configureIdentity(rewritten);
+  git(rewritten, "checkout", "--quiet", "--orphan", "rewritten-root");
+  git(rewritten, "rm", "--quiet", "-rf", ".");
+  write(rewritten, "rewritten.txt", "replacement history\n");
+  git(rewritten, "add", ".");
+  git(rewritten, "commit", "--quiet", "-m", "rewrite read-only history");
+  const rewrittenRevision = revision(rewritten);
+  git(rewritten, "push", "--quiet", "--force", "origin", "HEAD:main");
+
+  const coordinatorRemote = path.join(
+    fixture.temporaryDirectory,
+    "rewritten-read-only-coordinator",
+  );
+  run(REAL_GIT, [
+    "clone",
+    "--quiet",
+    "--branch",
+    "main",
+    fixture.coordinatorRemote,
+    coordinatorRemote,
+  ]);
+  configureIdentity(coordinatorRemote);
+  git(
+    coordinatorRemote,
+    "update-index",
+    "--info-only",
+    "--cacheinfo",
+    `160000,${rewrittenRevision},apps/frontend`,
+  );
+  git(coordinatorRemote, "commit", "--quiet", "-m", "publish rewritten read-only pin");
+  git(coordinatorRemote, "push", "--quiet", "origin", "main");
+  const before = {
+    coordinator: revision(fixture.coordinator),
+    backend: revision(fixture.backend),
+    frontend: revision(fixture.frontend),
+  };
+
+  const pulled = coordinatedAllowFailure(
+    fixture.coordinator,
+    "pull",
+    "--ff-only",
+  );
+  assert.notEqual(pulled.status, 0);
+  assert.match(pulled.stderr, /READ_ONLY_HISTORY_CONFLICT/);
+  assert.deepEqual(
+    {
+      coordinator: revision(fixture.coordinator),
+      backend: revision(fixture.backend),
+      frontend: revision(fixture.frontend),
+    },
+    before,
+  );
+});
+
+test("pull records a failed synchronization commit for guided completion", () => {
+  const fixture = createFixture();
+  const advanced = advanceRemote(
+    fixture,
+    fixture.backendRemote,
+    "main",
+    "rejected-sync-commit",
+  );
+  const hooks = path.join(fixture.temporaryDirectory, "reject-sync-commit");
+  mkdirSync(hooks);
+  writeFileSync(path.join(hooks, "pre-commit"), "#!/bin/sh\nexit 1\n", {
+    mode: 0o755,
+  });
+  git(fixture.coordinator, "config", "core.hooksPath", hooks);
+  const coordinatorRevision = revision(fixture.coordinator);
+
+  const pulled = coordinatedAllowFailure(
+    fixture.coordinator,
+    "pull",
+    "--ff-only",
+  );
+  assert.notEqual(pulled.status, 0);
+  assert.match(pulled.stderr, /PENDING_GITLINK_COMMIT/);
+  assert.equal(revision(fixture.backend), advanced);
+  assert.equal(revision(fixture.coordinator), coordinatorRevision);
+  assert.equal(
+    gitText(fixture.coordinator, "rev-parse", ":apps/backend"),
+    advanced,
+  );
+
+  const report = recoveryReport(fixture.coordinator);
+  assert.equal(report.lastFailure.code, "PENDING_GITLINK_COMMIT");
+  const issue = report.issues.find(
+    (entry) =>
+      entry.code === "PENDING_GITLINK_COMMIT" &&
+      entry.repository === "backend",
+  );
+  assert.ok(issue);
+  assert.ok(issue.commands.some((command) => /commit/.test(command)));
 });

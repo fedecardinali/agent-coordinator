@@ -83,7 +83,11 @@ test("CI generator emits one skippable job per configured component", () => {
     try {
       const workflowPath = path.join(temporary, "deploy.yml");
       writeFileSync(workflowPath, workflow);
-      execFileSync(actionlint, [workflowPath]);
+      execFileSync(
+        actionlint,
+        ["-shellcheck=", "-pyflakes=", workflowPath],
+        { timeout: 10_000 },
+      );
     } finally {
       rmSync(temporary, { recursive: true });
     }

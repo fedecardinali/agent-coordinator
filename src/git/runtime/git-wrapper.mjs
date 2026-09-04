@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
   openSync,
+  lstatSync,
+  renameSync,
   unlinkSync,
   readFileSync,
   readSync,
@@ -34,7 +36,14 @@ const SUPPORTED_COMMANDS = new Set([
   "worktree",
 ]);
 
-class CoordinatedGitError extends Error {}
+class CoordinatedGitError extends Error {
+  constructor(message, code = "GIT_OPERATION_FAILED") {
+    super(message);
+    this.code = code;
+  }
+}
+
+let activeContext;
 
 function run(command, argumentsList, options = {}) {
   const result = spawnSync(command, argumentsList, {
@@ -1014,6 +1023,7 @@ function assertBranchInvariant(context, rootReference = null) {
       .join(", ");
     throw new CoordinatedGitError(
       `branch invariant failed for coordinator '${coordinatorBranch}': ${details}.`,
+      "BRANCH_MISMATCH",
     );
   }
 
@@ -1033,6 +1043,7 @@ function assertFullInvariant(context, rootReference = null) {
   if (mismatches.length > 0) {
     throw new CoordinatedGitError(
       `coordinator gitlinks do not match child HEADs: ${mismatches.join(", ")}.`,
+      "GITLINK_MISMATCH",
     );
   }
   return branch;
@@ -1476,6 +1487,7 @@ function assertPullWorktreesClean(context) {
   if (dirty.length > 0) {
     throw new CoordinatedGitError(
       `coordinated pull requires clean worktrees: ${dirty.join(", ")}.`,
+      "DIRTY_WORKTREE",
     );
   }
 }
@@ -1489,6 +1501,7 @@ function fetchPullTarget(context, target, remote, options) {
   const argumentsList = [
     "fetch",
     ...options,
+    "--no-recurse-submodules",
     "--no-tags",
     remote,
     `+refs/heads/${target.branch}:${reference}`,
@@ -1499,7 +1512,12 @@ function fetchPullTarget(context, target, remote, options) {
   const result = target.root
     ? executeRootGit(context, argumentsList)
     : executeGit(target.directory, argumentsList);
-  if (result.status !== 0) return { result };
+  if (result.status !== 0) {
+    throw new CoordinatedGitError(
+      `Could not fetch ${target.label}/${target.branch}. Check the Git output above for authentication, connectivity, or a missing remote branch. No coordinated fast-forward has started.`,
+      "FETCH_FAILED",
+    );
+  }
 
   const localRevision = gitText(target.directory, ["rev-parse", "HEAD"]).stdout;
   const remoteRevision = gitText(target.directory, ["rev-parse", reference]).stdout;
@@ -1577,11 +1595,12 @@ function coordinatedPull(context) {
       label: "coordinator",
       root: true,
     },
-    ...writableRepositories(context).map((repository) => ({
+    ...context.repositories.map((repository) => ({
       branch: resolvedRepositoryBranch(repository, branch),
       directory: repository.directory,
       label: repository.id,
       repository,
+      readOnly: repository.branchPolicy.readOnly,
       root: false,
     })),
   ];
@@ -1602,20 +1621,109 @@ function coordinatedPull(context) {
   const plans = [];
   for (const target of targets) {
     const plan = fetchPullTarget(context, target, remote, options);
-    if (plan.result.status !== 0) return plan.result.status;
     plans.push(plan);
   }
 
-  const diverged = plans.filter((plan) => plan.state === "diverged");
+  const diverged = plans.filter((plan) =>
+    plan.state === "diverged" && !plan.target.readOnly);
   if (diverged.length > 0) {
     throw new CoordinatedGitError(
       `coordinated pull cannot fast-forward: ${diverged
         .map((plan) => `${plan.target.label}/${plan.target.branch}`)
         .join(", ")}. Resolve the divergence explicitly before retrying.`,
+      "DIVERGED_HISTORY",
     );
   }
 
-  for (const plan of plans) {
+  // Fetch objects first, then validate the incoming contract before moving any HEAD.
+  const rootPlan = plans.find((plan) => plan.target.root);
+  if (!rootPlan) throw new CoordinatedGitError("Pull planning lost the coordinator target.");
+  const incomingReference = rootPlan.state === "behind" ? rootPlan.reference : "HEAD";
+  const incomingConfiguration = loadContext(context, { revision: incomingReference });
+  if (!incomingConfiguration) throw new CoordinatedGitError(
+    "The incoming coordinator has no valid Agent Coordinator configuration. No coordinated fast-forward has started.",
+    "INCOMING_CONFIGURATION_MISSING",
+  );
+  const incomingContext = currentPolicyContext(
+    incomingConfiguration,
+    { revision: incomingReference },
+  );
+  if (
+    incomingContext.repositories.length !== context.repositories.length ||
+    incomingContext.repositories.some((repository) => {
+      const previous = context.repositories.find((entry) => entry.id === repository.id);
+      return !previous || previous.path !== repository.path ||
+        previous.branchPolicy.readOnly !== repository.branchPolicy.readOnly ||
+        resolvedRepositoryBranch(previous, branch) !== resolvedRepositoryBranch(repository, branch);
+    })
+  ) {
+    throw new CoordinatedGitError(
+      "The incoming coordinator changes repository paths or branch policies. Review its manifest before updating the workspace. No coordinated fast-forward has started.",
+      "INCOMING_CONFIGURATION_CHANGED",
+    );
+  }
+  const incomingRevisions = new Map();
+  for (const repository of incomingContext.repositories) {
+    const revision = rootGitlinkRevision(incomingContext, repository, incomingReference);
+    incomingRevisions.set(repository.id, revision);
+    const treeEntry = gitText(context.rootDirectory, [
+      "ls-tree", incomingReference, "--", repository.path,
+    ]);
+    if (!treeEntry.stdout.startsWith("160000 commit " + revision + "\t")) {
+      throw new CoordinatedGitError(
+        repository.id + " is not a valid gitlink in the incoming coordinator. No coordinated fast-forward has started.",
+        "INVALID_INCOMING_GITLINK",
+      );
+    }
+    const childPlan = plans.find((plan) => plan.target.repository?.id === repository.id);
+    if (!childPlan || !revisionIsAncestor(repository, revision, childPlan.remoteRevision)) {
+      throw new CoordinatedGitError(
+        repository.id + " cannot obtain incoming gitlink " + revision.slice(0, 8) +
+          " from " + remote + "/" + resolvedRepositoryBranch(repository, branch) +
+          ". The remote coordinator references an unpublished or rewritten commit. Repair that gitlink or restore the commit before retrying. No worktree or local branch was moved.",
+        "MISSING_INCOMING_COMMIT",
+      );
+    }
+    if (repository.branchPolicy.readOnly &&
+        repository.branchPolicy.mode !== "pinned" &&
+        revision !== childPlan.remoteRevision &&
+        revision !== gitText(repository.directory, ["rev-parse", "HEAD"]).stdout) {
+      throw new CoordinatedGitError(
+        repository.id + " is read-only and its incoming gitlink is not the fetched branch tip. Review that coordinator revision before retrying.",
+        "AMBIGUOUS_READ_ONLY_UPDATE",
+      );
+    }
+    if (repository.branchPolicy.readOnly &&
+        repository.branchPolicy.mode !== "pinned" &&
+        revision !== gitText(repository.directory, ["rev-parse", "HEAD"]).stdout &&
+        childPlan.state !== "behind") {
+      throw new CoordinatedGitError(
+        repository.id + " is read-only and cannot fast-forward safely to its incoming gitlink. Preserve or reconcile its local history before retrying.",
+        "READ_ONLY_HISTORY_CONFLICT",
+      );
+    }
+  }
+
+  // Advance children before the coordinator. A later failure can then be repaired
+  // by recording their tips; the coordinator never moves before all children do.
+  const applyPlans = [...plans.filter((plan) => !plan.target.root), rootPlan];
+  for (const plan of applyPlans) {
+    const currentRevision = gitText(plan.target.directory, ["rev-parse", "HEAD"]).stdout;
+    if (currentRevision !== plan.localRevision) {
+      throw new CoordinatedGitError(
+        plan.target.label + " changed after pull planning. Run the pull again.",
+        "STALE_PULL_PLAN",
+      );
+    }
+    if (plan.target.readOnly &&
+        currentRevision === incomingRevisions.get(plan.target.repository.id)) {
+      continue;
+    }
+    if (plan.target.readOnly && plan.target.repository.branchPolicy.mode === "pinned") {
+      const revision = incomingRevisions.get(plan.target.repository.id);
+      if (currentRevision !== revision) switchRepositoryDetached(plan.target.directory, revision);
+      continue;
+    }
     if (plan.state !== "behind") continue;
     process.stderr.write(
       `[agent-coordinator] fast-forwarding ${plan.target.label}/${plan.target.branch}...\n`,
@@ -1624,7 +1732,12 @@ function coordinatedPull(context) {
     const result = plan.target.root
       ? executeRootGit(context, argumentsList)
       : executeGit(plan.target.directory, argumentsList);
-    if (result.status !== 0) return result.status;
+    if (result.status !== 0) {
+      throw new CoordinatedGitError(
+        "Could not fast-forward " + plan.target.label + ". Earlier child repositories may already be updated; run 'coordinator git recover' to inspect the exact state.",
+        "PARTIAL_PULL",
+      );
+    }
   }
 
   const stageResult = executeRootGit(context, [
@@ -1632,7 +1745,12 @@ function coordinatedPull(context) {
     "--",
     ...context.repositories.map((repository) => repository.path),
   ]);
-  if (stageResult.status !== 0) return stageResult.status;
+  if (stageResult.status !== 0) {
+    throw new CoordinatedGitError(
+      "Repositories were updated, but their gitlinks could not be staged. Run 'coordinator git recover' to inspect and record the current revisions.",
+      "PARTIAL_PULL",
+    );
+  }
 
   if (hasStagedChanges(context.rootDirectory)) {
     process.stderr.write(
@@ -1643,7 +1761,12 @@ function coordinatedPull(context) {
       "-m",
       "Sync coordinated repositories",
     ]);
-    if (commitResult.status !== 0) return commitResult.status;
+    if (commitResult.status !== 0) {
+      throw new CoordinatedGitError(
+        "Repositories and staged gitlinks are updated, but the coordinator commit failed. Review the Git error above, then commit the staged gitlinks.",
+        "PENDING_GITLINK_COMMIT",
+      );
+    }
   }
 
   const refreshedContext = loadContext(
@@ -1969,6 +2092,43 @@ function planBranchAtRevision(repository, branch, desiredRevision) {
   return true;
 }
 
+function revisionIsAncestor(repository, ancestor, descendant) {
+  return (
+    gitText(
+      repository.directory,
+      ["merge-base", "--is-ancestor", ancestor, descendant],
+      { allowFailure: true },
+    ).status === 0
+  );
+}
+
+function assertPreparedBranchRevision(
+  repository,
+  prepared,
+  { checkedOut = false } = {},
+) {
+  if (!prepared.expectedBranchRevision) return;
+  const reference = gitText(
+    repository.directory,
+    ["rev-parse", `refs/heads/${prepared.branch}`],
+    { allowFailure: true },
+  );
+  const checkoutMatches =
+    !checkedOut ||
+    (currentBranch(repository.directory) === prepared.branch &&
+      gitText(repository.directory, ["rev-parse", "HEAD"]).stdout ===
+        prepared.expectedBranchRevision);
+  if (
+    reference.status !== 0 ||
+    reference.stdout !== prepared.expectedBranchRevision ||
+    !checkoutMatches
+  ) {
+    throw new CoordinatedGitError(
+      `${repository.id} branch '${prepared.branch}' changed after checkout planning. Retry once the child repository is stable.`,
+    );
+  }
+}
+
 function readTerminalLine() {
   let terminal;
   try {
@@ -2116,6 +2276,51 @@ function prepareRepositoryAtRevision(
     coordinatorBranch,
   );
   if (repository.branchPolicy.mode !== "pinned") {
+    validateBranchName(repositoryBranch);
+    if (
+      options.reconcileExistingBranch &&
+      branchExists(repository.directory, repositoryBranch)
+    ) {
+      assertCommitAvailable(repository, desiredRevision, "the target branch");
+      const branchRevision = gitText(repository.directory, [
+        "rev-parse",
+        `refs/heads/${repositoryBranch}`,
+      ]).stdout;
+      if (branchRevision === desiredRevision) {
+        return {
+          branch: repositoryBranch,
+          created: false,
+          desiredRevision,
+          detached: false,
+          expectedBranchRevision: branchRevision,
+          updateGitlink: false,
+        };
+      }
+      if (
+        !repository.branchPolicy.readOnly &&
+        revisionIsAncestor(repository, desiredRevision, branchRevision)
+      ) {
+        return {
+          branch: repositoryBranch,
+          created: false,
+          desiredRevision: branchRevision,
+          detached: false,
+          expectedBranchRevision: branchRevision,
+          previousGitlink: desiredRevision,
+          updateGitlink: true,
+        };
+      }
+      if (!repository.branchPolicy.readOnly) {
+        if (revisionIsAncestor(repository, branchRevision, desiredRevision)) {
+          throw new CoordinatedGitError(
+            `${repository.id} branch '${repositoryBranch}' at ${branchRevision.slice(0, 8)} is behind target gitlink ${desiredRevision.slice(0, 8)}. Fast-forward the child branch before switching.`,
+          );
+        }
+        throw new CoordinatedGitError(
+          `${repository.id} branch '${repositoryBranch}' at ${branchRevision.slice(0, 8)} has diverged from target gitlink ${desiredRevision.slice(0, 8)}. Resolve the child branch or mapping before switching.`,
+        );
+      }
+    }
     const created = options.planOnly
       ? planBranchAtRevision(repository, repositoryBranch, desiredRevision)
       : prepareBranchAtRevision(
@@ -2265,6 +2470,7 @@ function assertCleanWorkspaceBranchChange(context) {
   if (status.stdout) {
     throw new CoordinatedGitError(
       "the coordinator and its submodules must be clean before creating or switching a manifest-managed branch.",
+      "DIRTY_WORKTREE",
     );
   }
 }
@@ -2480,7 +2686,11 @@ function assertRepositoriesClean(contexts) {
   }
 }
 
-function assertCommitAvailable(repository, revision) {
+function assertCommitAvailable(
+  repository,
+  revision,
+  requirement = "the start-point",
+) {
   const result = gitText(
     repository.directory,
     ["cat-file", "-e", `${revision}^{commit}`],
@@ -2488,7 +2698,8 @@ function assertCommitAvailable(repository, revision) {
   );
   if (result.status !== 0) {
     throw new CoordinatedGitError(
-      `${repository.id} does not contain gitlink commit ${revision.slice(0, 8)} required by the start-point.`,
+      `${repository.id} does not contain gitlink commit ${revision.slice(0, 8)} required by ${requirement}.`,
+      "MISSING_GITLINK_COMMIT",
     );
   }
 }
@@ -2750,11 +2961,13 @@ function switchCoordinatedBranch(context, branch) {
     state: repositoryState(repository),
   }));
   const createdBranches = [];
+  let rootSwitched = false;
   const targetContext = context.workspaceManifest
     ? manifestPolicyContext(context, branch, { revision: branch })
     : context;
+  let preparedRepositories = [];
   try {
-    const preparedRepositories = targetContext.repositories.map(
+    preparedRepositories = targetContext.repositories.map(
       (repository) => ({
         repository,
         prepared: prepareRepositoryAtRevision(
@@ -2763,9 +2976,28 @@ function switchCoordinatedBranch(context, branch) {
           branch,
           rootGitlinkRevision(targetContext, repository, branch),
           createdBranches,
+          { planOnly: true, reconcileExistingBranch: true },
         ),
       }),
     );
+
+    for (const { repository, prepared } of preparedRepositories) {
+      if (!prepared.created) continue;
+      const result = executeGit(repository.directory, [
+        "branch",
+        prepared.branch,
+        prepared.desiredRevision,
+      ]);
+      if (result.status !== 0) {
+        throw new CoordinatedGitError(
+          `could not create '${prepared.branch}' in ${repository.id}.`,
+        );
+      }
+      createdBranches.push({
+        repository: repository.directory,
+        branch: prepared.branch,
+      });
+    }
 
     for (const { repository, prepared } of preparedRepositories) {
       if (prepared.detached) {
@@ -2774,7 +3006,11 @@ function switchCoordinatedBranch(context, branch) {
           rootGitlinkRevision(targetContext, repository, branch),
         );
       } else {
+        assertPreparedBranchRevision(repository, prepared);
         switchRepository(repository.directory, prepared.branch);
+        assertPreparedBranchRevision(repository, prepared, {
+          checkedOut: true,
+        });
         if (prepared.created) {
           setUpstreamFromRemote(
             targetContext,
@@ -2785,14 +3021,59 @@ function switchCoordinatedBranch(context, branch) {
       }
     }
     switchRepository(context.rootDirectory, branch);
+    rootSwitched = true;
+    const advancedRepositories = preparedRepositories.filter(
+      ({ prepared }) => prepared.updateGitlink,
+    );
+    for (const { repository, prepared } of advancedRepositories) {
+      assertPreparedBranchRevision(repository, prepared, {
+        checkedOut: true,
+      });
+      const result = executeGit(context.rootDirectory, [
+        "update-index",
+        "--cacheinfo",
+        `160000,${prepared.desiredRevision},${repository.path}`,
+      ]);
+      if (result.status !== 0) {
+        throw new CoordinatedGitError(
+          `could not stage the updated ${repository.id} gitlink.`,
+        );
+      }
+    }
     const effectiveContext = currentPolicyContext(context);
     assertFullInvariant(effectiveContext);
+    if (advancedRepositories.length > 0) {
+      process.stderr.write(
+        `[agent-coordinator] staged updated gitlinks: ${advancedRepositories.map(({ repository }) => repository.id).join(", ")}.\n`,
+      );
+    }
     process.stderr.write(
       `[agent-coordinator] switched to '${branch}': ${branchMappingSummary(effectiveContext, branch)}.\n`,
     );
     return 0;
   } catch (error) {
+    const gitlinkRollbackFailures = [];
+    if (rootSwitched) {
+      for (const { repository, prepared } of preparedRepositories) {
+        if (!prepared.updateGitlink) continue;
+        const result = executeGit(
+          context.rootDirectory,
+          [
+            "update-index",
+            "--cacheinfo",
+            `160000,${prepared.previousGitlink},${repository.path}`,
+          ],
+          { capture: true },
+        );
+        if (result.status !== 0) gitlinkRollbackFailures.push(repository.id);
+      }
+    }
     rollbackRepositories(states, createdBranches);
+    if (gitlinkRollbackFailures.length > 0) {
+      process.stderr.write(
+        `[agent-coordinator] WARNING: rollback could not restore staged gitlinks for ${gitlinkRollbackFailures.join(", ")}.\n`,
+      );
+    }
     throw error;
   }
 }
@@ -3317,6 +3598,288 @@ function runHook(argumentsList) {
   throw new CoordinatedGitError(`unsupported hook: ${hook}`);
 }
 
+function recoveryCommand(directory, argumentsList) {
+  const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
+  return ["git", "-C", quote(directory), ...argumentsList.map(quote)].join(" ");
+}
+
+function recoveryChanges(directory, ignoredPaths = []) {
+  const result = git(["-C", directory, "status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=none"], { capture: true });
+  if (result.status !== 0) throw new CoordinatedGitError("Could not inspect changes in " + directory);
+  const entries = (result.stdout || "").split("\0");
+  const changes = [];
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    if (!entry) continue;
+    const file = entry.slice(3);
+    const status = entry.slice(0, 2);
+    const managedGitlinkChange =
+      ignoredPaths.includes(file) && [" M", "M ", "MM"].includes(status);
+    if (!managedGitlinkChange) changes.push(entry);
+    if (/[RC]/.test(entry.slice(0, 2))) index++;
+  }
+  return changes;
+}
+
+function recoveryOperationInProgress(directory) {
+  return ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer"].some((name) => {
+    const location = gitText(directory, ["rev-parse", "--git-path", name]).stdout;
+    return existsSync(path.resolve(directory, location));
+  });
+}
+
+function lastFailurePath(context) {
+  return path.resolve(context.rootDirectory, gitText(context.rootDirectory, [
+    "rev-parse", "--git-path", "agent-coordinator-last-error.json",
+  ]).stdout);
+}
+
+function readLastFailure(context) {
+  try {
+    const file = lastFailurePath(context);
+    if (lstatSync(file).isSymbolicLink()) return null;
+    const value = JSON.parse(readFileSync(file, "utf8"));
+    return value.owner === "Agent Coordinator" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberFailure(context, error) {
+  if (!context || !SUPPORTED_COMMANDS.has(context.command)) return;
+  let temporary;
+  try {
+    const file = lastFailurePath(context);
+    if (existsSync(file) && !readLastFailure(context)) return;
+    temporary = file + "." + randomUUID();
+    // Deliberately exclude raw arguments, Git output, remote URLs and file contents.
+    writeFileSync(temporary, JSON.stringify({
+      owner: "Agent Coordinator", schemaVersion: 1,
+      at: new Date().toISOString(), operation: context.command,
+      code: error.code || "GIT_OPERATION_FAILED",
+    }) + "\n", { mode: 0o600, flag: "wx" });
+    renameSync(temporary, file);
+  } catch {
+    // Diagnostics must never replace the original failure.
+  } finally {
+    if (temporary && existsSync(temporary)) unlinkSync(temporary);
+  }
+}
+
+function diagnoseRecovery(context) {
+  context = currentPolicyContext(context);
+  const branch = currentBranch(context.rootDirectory);
+  const issues = [];
+  const blocked = [];
+  const alignBlocked = [];
+  const recordBlocked = [];
+  const alignSteps = [];
+  const recordSteps = [];
+  const repositories = [];
+  const addIssue = (code, repository, message, commands = []) =>
+    issues.push({ code, repository, message, commands });
+  const rootChanges = recoveryChanges(context.rootDirectory, context.repositories.map((repository) => repository.path));
+  if (!branch) {
+    blocked.push("Choose a coordinator branch first; its HEAD is detached.");
+    addIssue("DETACHED_COORDINATOR", "coordinator", blocked.at(-1), ["git branch --all"]);
+  }
+  if (rootChanges.length) {
+    blocked.push("Save the coordinator's file changes before applying a repair.");
+    addIssue("DIRTY_WORKTREE", "coordinator", blocked.at(-1), [
+      recoveryCommand(context.rootDirectory, ["status", "--short"]),
+      recoveryCommand(context.rootDirectory, ["stash", "push", "--include-untracked", "-m", "Before coordinator recovery"]),
+    ]);
+  }
+  if (recoveryOperationInProgress(context.rootDirectory)) {
+    blocked.push("Finish or abort the coordinator's current merge, rebase or cherry-pick first.");
+    addIssue("OPERATION_IN_PROGRESS", "coordinator", blocked.at(-1), ["git status"]);
+  }
+  for (const repository of context.repositories) {
+    if (!isRepositoryAt(repository.directory)) {
+      blocked.push(repository.id + " is not initialized.");
+      addIssue("NOT_INITIALIZED", repository.id, blocked.at(-1), [
+        recoveryCommand(context.rootDirectory, ["submodule", "update", "--init", "--", repository.path]),
+      ]);
+      repositories.push({ id: repository.id, initialized: false });
+      continue;
+    }
+    const state = repositoryState(repository.directory);
+    const changes = recoveryChanges(repository.directory);
+    const gitlink = rootGitlink(context, repository);
+    const entry = gitText(context.rootDirectory, ["ls-files", "--stage", "--", repository.path]).stdout;
+    let expectedBranch = null;
+    try {
+      if (branch) expectedBranch = resolvedRepositoryBranch(repository, branch);
+    } catch (error) {
+      blocked.push(error.message);
+      addIssue("MISSING_BRANCH_MAPPING", repository.id, error.message + " Review " + context.configurationLabel + ".");
+    }
+    const pinnedDetached = repository.branchPolicy.mode === "pinned" && !state.branch &&
+      gitlink.status === 0 && expectedBranch &&
+      branchContainsRevision(context, repository, expectedBranch, gitlink.stdout);
+    const branchMatches = Boolean(expectedBranch && (state.branch === expectedBranch || pinnedDetached));
+    const reference = expectedBranch
+      ? gitText(repository.directory, ["rev-parse", "--verify", "refs/heads/" + expectedBranch], { allowFailure: true }).stdout
+      : null;
+    repositories.push({
+      id: repository.id, path: repository.path, initialized: true,
+      branch: state.branch, expectedBranch, revision: state.revision,
+      recordedRevision: gitlink.status === 0 ? gitlink.stdout : null,
+      expectedBranchRevision: reference, readOnly: repository.branchPolicy.readOnly, changes, entry,
+    });
+    if (changes.length) {
+      blocked.push(repository.id + " has uncommitted files. Save them before repairing.");
+      addIssue("DIRTY_WORKTREE", repository.id, blocked.at(-1), [
+        recoveryCommand(repository.directory, ["status", "--short"]),
+        recoveryCommand(repository.directory, ["stash", "push", "--include-untracked", "-m", "Before coordinator recovery"]),
+      ]);
+    }
+    if (recoveryOperationInProgress(repository.directory)) {
+      blocked.push(repository.id + " has an unfinished Git operation. Use git status there to continue or abort it.");
+      addIssue("OPERATION_IN_PROGRESS", repository.id, blocked.at(-1), [recoveryCommand(repository.directory, ["status"])]);
+    }
+    if (gitlink.status !== 0 || !/^160000 [a-f0-9]+ 0\t/.test(entry)) {
+      blocked.push(repository.id + " has no unambiguous gitlink in the index. Resolve the coordinator index first.");
+      addIssue("MISSING_GITLINK", repository.id, blocked.at(-1));
+      continue;
+    }
+    const committedGitlink = rootGitlink(context, repository, "HEAD");
+    if (committedGitlink.status === 0 && committedGitlink.stdout !== gitlink.stdout) {
+      addIssue(
+        "PENDING_GITLINK_COMMIT",
+        repository.id,
+        "Revision " + gitlink.stdout.slice(0, 8) + " is staged but not committed in the coordinator.",
+        [
+          recoveryCommand(context.rootDirectory, ["diff", "--cached", "--submodule=short"]),
+          recoveryCommand(context.rootDirectory, ["commit", "-m", "Record coordinated repository revisions"]),
+        ],
+      );
+    }
+    if (!branchMatches) {
+      recordBlocked.push(repository.id + " must match its branch policy before recording its revision.");
+      addIssue("BRANCH_MISMATCH", repository.id,
+        "On " + (state.branch || "detached HEAD") + "; coordinator '" + branch + "' expects '" + expectedBranch + "'. Align the checkout, or correct the branch mapping in " + context.configurationLabel + ".");
+    }
+    if (state.revision !== gitlink.stdout) {
+      addIssue("GITLINK_MISMATCH", repository.id,
+        "Checkout is at " + state.revision.slice(0, 8) + "; coordinator records " + gitlink.stdout.slice(0, 8) + ". Choose which revision to keep.");
+      if (repository.branchPolicy.readOnly) {
+        recordBlocked.push(repository.id + " is read-only; its recorded revision cannot be changed by this repair.");
+      } else {
+        recordSteps.push({ repository: repository.id, path: repository.path, from: gitlink.stdout, to: state.revision,
+          description: "Record " + repository.id + " at " + state.revision.slice(0, 8) + " (stage its gitlink only)." });
+      }
+    }
+    const available = gitText(repository.directory, ["cat-file", "-e", gitlink.stdout + "^{commit}"], { allowFailure: true }).status === 0;
+    if (!available) {
+      alignBlocked.push(repository.id + " is missing recorded commit " + gitlink.stdout.slice(0, 8) + ".");
+      addIssue("MISSING_GITLINK_COMMIT", repository.id, alignBlocked.at(-1) + " Fetch it; if the server says 'not our ref', restore the commit on the remote or review a replacement gitlink.", [
+        recoveryCommand(repository.directory, ["fetch", "--no-recurse-submodules", context.configuration.remote || "origin", gitlink.stdout]),
+      ]);
+    }
+    if (!branchMatches || state.revision !== gitlink.stdout) {
+      if (!state.branch && !revisionIsAncestor(repository, state.revision, gitlink.stdout)) {
+        alignBlocked.push(repository.id + " has detached work that must be saved on a branch before switching.");
+      }
+      try {
+        const prepared = prepareRepositoryAtRevision(context, repository, branch, gitlink.stdout, [], { planOnly: true });
+        if (prepared.detached && !branchContainsRevision(context, repository, expectedBranch, gitlink.stdout)) {
+          throw new CoordinatedGitError(repository.id + " recorded revision is outside its pinned branch.");
+        }
+        alignSteps.push({ repository: repository.id, path: repository.path, from: state.revision, to: gitlink.stdout,
+          description: "Align " + repository.id + " to " + (prepared.detached ? "detached " : expectedBranch + " at ") + gitlink.stdout.slice(0, 8),
+          prepared });
+      } catch (error) {
+        alignBlocked.push(error.message + " Existing branches will not be reset.");
+      }
+    }
+    const upstream = gitText(repository.directory, ["rev-parse", "--verify", "@{upstream}"], { allowFailure: true });
+    if (upstream.status === 0 && !revisionIsAncestor(repository, state.revision, upstream.stdout) &&
+        !revisionIsAncestor(repository, upstream.stdout, state.revision)) {
+      addIssue("DIVERGED_HISTORY", repository.id, "Local and cached upstream histories have diverged. Review the commits and choose merge or rebase in this repository.", [
+        recoveryCommand(repository.directory, ["log", "--oneline", "--left-right", "HEAD...@{upstream}"]),
+      ]);
+    }
+  }
+  // Inspect cached incoming pins without fetching or changing the workspace.
+  const upstream = gitText(context.rootDirectory, ["rev-parse", "--verify", "@{upstream}"], { allowFailure: true });
+  if (upstream.status === 0) {
+    for (const repository of context.repositories) {
+      if (!isRepositoryAt(repository.directory)) continue;
+      const incoming = rootGitlink(context, repository, upstream.stdout);
+      if (incoming.status === 0 &&
+          gitText(repository.directory, ["cat-file", "-e", incoming.stdout + "^{commit}"], { allowFailure: true }).status !== 0) {
+        addIssue("MISSING_INCOMING_COMMIT", repository.id,
+          "Cached upstream coordinator references " + incoming.stdout.slice(0, 8) + ", which is not available locally. Fetch that commit; if the remote cannot provide it, its coordinator gitlink needs repair. This diagnosis does not contact the remote.", [
+            recoveryCommand(repository.directory, ["fetch", "--no-recurse-submodules", context.configuration.remote || "origin", incoming.stdout]),
+          ]);
+      }
+    }
+  }
+  const plans = [
+    { strategy: "align", label: "Use the revisions recorded by the coordinator", steps: alignSteps, blocked: [...blocked, ...alignBlocked] },
+    { strategy: "record", label: "Keep current checkouts and stage their revisions", steps: recordSteps, blocked: [...blocked, ...recordBlocked] },
+  ].map((plan) => ({ ...plan, available: plan.steps.length > 0 && plan.blocked.length === 0 }));
+  const snapshot = { branch, head: gitText(context.rootDirectory, ["rev-parse", "HEAD"]).stdout,
+    rootChanges, repositories, plans, configuration: context.configuration,
+    manifest: context.workspaceManifest ? readFileSync(context.workspaceManifest.absolutePath, "utf8") : null };
+  return {
+    schemaVersion: 1, owner: "Agent Coordinator", root: context.rootDirectory, branch,
+    snapshot: createHash("sha256").update(JSON.stringify(snapshot)).digest("hex"),
+    issues, plans, repositories, lastFailure: readLastFailure(context), applied: false,
+  };
+}
+
+function applyRecovery(context, strategy, snapshot) {
+  context = currentPolicyContext(context);
+  const report = diagnoseRecovery(context);
+  if (report.snapshot !== snapshot) throw new CoordinatedGitError(
+    "The workspace changed since this preview. Run coordinator git recover again to review a fresh plan.", "STALE_RECOVERY_PLAN");
+  const plan = report.plans.find((entry) => entry.strategy === strategy);
+  if (!plan?.available) throw new CoordinatedGitError(
+    "This recovery cannot be applied: " + (plan?.blocked.join(" ") || "no changes to apply."), "RECOVERY_BLOCKED");
+  const states = context.repositories.map((repository) => ({
+    repository: repository.directory, state: repositoryState(repository.directory),
+  }));
+  const createdBranches = [];
+  try {
+    if (strategy === "record") {
+      const argumentsList = ["update-index"];
+      for (const step of plan.steps) {
+        argumentsList.push("--cacheinfo", "160000," + step.to + "," + step.path);
+      }
+      const result = executeGit(context.rootDirectory, argumentsList, { capture: true });
+      if (result.status !== 0) throw new CoordinatedGitError(
+        "Could not stage repository revisions. The index was left unchanged.",
+        "RECOVERY_STAGE_FAILED",
+      );
+    }
+    for (const step of plan.steps) {
+      const repository = context.repositories.find((entry) => entry.id === step.repository);
+      if (strategy === "align") {
+        const prepared = prepareRepositoryAtRevision(context, repository, report.branch, step.to, createdBranches);
+        checkoutPreparedRepository(context, repository, prepared);
+      }
+    }
+    assertFullInvariant(context);
+    assertReadOnlyRepositoriesClean(context);
+    return { ...diagnoseRecovery(context), applied: true, strategy,
+      next: strategy === "record"
+        ? ["git diff --cached --submodule=short", "git commit -m 'Record coordinated repository revisions'"]
+        : ["coordinator git check", "Retry your original Git command."] };
+  } catch (error) {
+    const rollbackFailures = [];
+    for (const step of strategy === "record" ? [...plan.steps].reverse() : []) {
+      if (executeGit(context.rootDirectory, ["update-index", "--cacheinfo", "160000," + step.from + "," + step.path], { capture: true }).status !== 0) {
+        rollbackFailures.push(step.repository);
+      }
+    }
+    if (strategy === "align") rollbackRepositories(states, createdBranches);
+    if (rollbackFailures.length) process.stderr.write("[agent-coordinator] WARNING: restore staged gitlinks manually for " + rollbackFailures.join(", ") + ".\n");
+    throw error;
+  }
+}
+
 function dispatch(context) {
   switch (context.command) {
     case "add":
@@ -3342,6 +3905,30 @@ function dispatch(context) {
 
 function main() {
   const argumentsList = process.argv.slice(2);
+  if (argumentsList[0] === "--diagnose" || argumentsList[0] === "--recover") {
+    const invocation = {
+      command: "recover",
+      commandArguments: [],
+      effectiveDirectory: process.cwd(),
+      forwardedGlobalOptions: [],
+    };
+    const context = loadContext(invocation);
+    if (!context) throw new CoordinatedGitError(
+      "current directory is not a configured coordinator root.", "GIT_CONFIGURATION_MISSING");
+    activeContext = context;
+    if (argumentsList[0] === "--diagnose") {
+      process.stdout.write(JSON.stringify(diagnoseRecovery(context)) + "\n");
+      return 0;
+    }
+    const strategy = argumentsList[1];
+    const snapshot = argumentsList[2];
+    if (!["align", "record"].includes(strategy) || !snapshot) {
+      throw new CoordinatedGitError(
+        "Recovery requires a reviewed strategy and snapshot.", "INVALID_RECOVERY_REQUEST");
+    }
+    process.stdout.write(JSON.stringify(applyRecovery(context, strategy, snapshot)) + "\n");
+    return 0;
+  }
   if (argumentsList[0] === "--hook") {
     return runHook(argumentsList.slice(1));
   }
@@ -3399,6 +3986,7 @@ function main() {
     configurationSourceForInvocation(invocation),
   );
   if (!context) return git(argumentsList).status;
+  activeContext = context;
   return dispatch(context);
 }
 
@@ -3408,6 +3996,16 @@ try {
 } catch (error) {
   const message =
     error instanceof Error ? error.message : "unknown coordinated Git error";
-  process.stderr.write(`[agent-coordinator] ERROR: ${message}\n`);
+  process.stderr.write(
+    `[agent-coordinator] ERROR: [${error instanceof CoordinatedGitError ? error.code : "UNEXPECTED_ERROR"}] ${message}\n`,
+  );
+  if (error instanceof CoordinatedGitError) {
+    rememberFailure(activeContext, error);
+    if (activeContext?.command !== "recover") {
+      process.stderr.write(
+        "[agent-coordinator] Next: run 'coordinator git recover' for a diagnosis and safe recovery options.\n",
+      );
+    }
+  }
   process.exitCode = error instanceof CoordinatedGitError ? 1 : 2;
 }

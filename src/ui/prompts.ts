@@ -24,6 +24,10 @@ import type {
   CoordinatorManifest,
 } from "../core/schema.js";
 import type {
+  GitRecoveryPlan,
+  GitRecoveryReport,
+} from "../git/install.js";
+import type {
   NestedSubmoduleRepairPlan,
   NestedSubmoduleRepairResult,
 } from "../workspace/nested-repair.js";
@@ -60,6 +64,53 @@ function value<T>(input: T | symbol): T {
     throw new CoordinatorError("Operation cancelled.", "CANCELLED");
   }
   return input;
+}
+
+export function reportGitRecovery(report: GitRecoveryReport): void {
+  const lines: string[] = [];
+  if (report.lastFailure) {
+    lines.push(
+      `Last failure: ${report.lastFailure.operation} · ${report.lastFailure.code} · ${report.lastFailure.at}`,
+    );
+  }
+  if (report.issues.length === 0) lines.push("No Git coordination problems detected.");
+  for (const issue of report.issues) {
+    lines.push(`[${issue.code}] ${issue.repository}: ${issue.message}`);
+    for (const command of issue.commands) lines.push(`  → ${command}`);
+  }
+  for (const plan of report.plans.filter((entry) => !entry.available && entry.steps.length)) {
+    lines.push(`${plan.label} is unavailable: ${plan.blocked.join(" ")}`);
+  }
+  note(lines.join("\n"), "Git recovery diagnosis");
+}
+
+export async function promptGitRecovery(
+  report: GitRecoveryReport,
+): Promise<GitRecoveryPlan | null> {
+  reportGitRecovery(report);
+  const available = report.plans.filter((plan) => plan.available);
+  if (available.length === 0) return null;
+  const strategy = value(
+    await select({
+      message: "Choose a recovery plan",
+      options: [
+        ...available.map((plan) => ({
+          value: plan.strategy,
+          label: plan.label,
+          hint: `${plan.steps.length} change${plan.steps.length === 1 ? "" : "s"}`,
+        })),
+        { value: "cancel" as const, label: "Exit without changes" },
+      ],
+    }),
+  );
+  if (strategy === "cancel") return null;
+  const plan = available.find((entry) => entry.strategy === strategy)!;
+  note(plan.steps.map((step) => `• ${step.description}`).join("\n"), "Recovery preview");
+  const accepted = value(await confirm({
+    message: "Apply this recovery plan?",
+    initialValue: false,
+  }));
+  return accepted ? plan : null;
 }
 
 function slug(input: string): string {

@@ -23,6 +23,8 @@ import {
 } from "./core/schema.js";
 import { runDoctor, type DoctorResult } from "./doctor/check.js";
 import {
+  applyGitRecovery,
+  inspectGitRecovery,
   installMachineGitRuntime,
   installWorkspaceGitIntegration,
   invokeGitRuntime,
@@ -30,12 +32,14 @@ import {
   uninstallWorkspaceGitIntegration,
   yamlNativeGitRuntimeActive,
 } from "./git/install.js";
+import type { GitRecoveryPlan, GitRecoveryReport } from "./git/install.js";
 import { inspectWorkspace, demoWorkspaceStatus } from "./status/inspect.js";
 import { renderDashboard } from "./ui/dashboard.js";
 import { runLocalCompose } from "./local/compose.js";
 import {
   finishWorkspacePrompt,
   promptNestedSubmoduleRepair,
+  promptGitRecovery,
   promptDashboardAction,
   promptResumeWorkspace,
   promptWorkspaceManifest,
@@ -43,6 +47,8 @@ import {
 } from "./ui/prompts.js";
 import { VERSION } from "./version.js";
 import { applyUpdate, checkForUpdate } from "./update/check.js";
+import { runDailyUpdatePrompt } from "./update/daily.js";
+import { promptForDailyUpdate } from "./ui/update.js";
 import {
   initializeWorkspace,
   repositoryCloneUrl,
@@ -608,6 +614,82 @@ for (const command of ["install", "uninstall", "attach", "check"] as const) {
     });
 }
 
+function printGitRecovery(report: GitRecoveryReport, plan?: GitRecoveryPlan): void {
+  if (report.lastFailure) {
+    process.stdout.write(
+      `Last coordinated Git failure: ${report.lastFailure.operation} (${report.lastFailure.code}) at ${report.lastFailure.at}.\n`,
+    );
+  }
+  if (!report.issues.length) process.stdout.write("No Git coordination problems detected.\n");
+  for (const issue of report.issues) {
+    process.stdout.write(`[${issue.code}] ${issue.repository}: ${issue.message}\n`);
+    for (const command of issue.commands) process.stdout.write(`  Try: ${command}\n`);
+  }
+  const plans = plan ? [plan] : report.plans;
+  for (const candidate of plans) {
+    process.stdout.write(
+      `\n${candidate.label}: ${candidate.available ? "available" : "unavailable"}\n`,
+    );
+    for (const step of candidate.steps) process.stdout.write(`  - ${step.description}\n`);
+    for (const reason of candidate.blocked) process.stdout.write(`  Blocked: ${reason}\n`);
+  }
+}
+
+git.command("recover")
+  .description("diagnose coordinated Git failures and preview safe recovery options")
+  .option("--strategy <strategy>", "recovery strategy: align or record")
+  .option("--write", "apply the selected recovery plan")
+  .option("--dry-run", "print the diagnosis and recovery plan without changes")
+  .action(async (options: {
+    strategy?: string;
+    write?: boolean;
+    dryRun?: boolean;
+  }) => {
+    if (options.write && options.dryRun) {
+      throw new CoordinatorError("--write and --dry-run cannot be used together.");
+    }
+    if (options.strategy && !["align", "record"].includes(options.strategy)) {
+      throw new CoordinatorError("--strategy must be 'align' or 'record'.");
+    }
+    if (options.write && !options.strategy && !process.stdin.isTTY) {
+      throw new CoordinatorError("--write requires --strategy outside an interactive terminal.");
+    }
+    const root = findWorkspaceRoot() ?? process.cwd();
+    const diagnosis = inspectGitRecovery(root);
+    const json = globals(program).json;
+    let plan = options.strategy
+      ? diagnosis.plans.find((entry) => entry.strategy === options.strategy)
+      : undefined;
+    if (options.strategy && !plan) throw new CoordinatorError("Recovery plan is unavailable.");
+
+    if (json || options.dryRun || options.strategy || !process.stdin.isTTY) {
+      if (json) {
+        if (!options.write) {
+          writeJson({ command: "recover", report: diagnosis, selectedPlan: plan ?? null });
+        }
+      } else {
+        printGitRecovery(diagnosis, plan);
+      }
+      if (!options.write) return;
+    } else {
+      plan = (await promptGitRecovery(diagnosis)) ?? undefined;
+      if (!plan) return;
+    }
+
+    if (!plan?.available) {
+      throw new CoordinatorError(
+        `Recovery cannot be applied: ${plan?.blocked.join(" ") || "no changes are required."}`,
+        "GIT_RECOVERY_BLOCKED",
+      );
+    }
+    const result = applyGitRecovery(root, plan.strategy, diagnosis.snapshot);
+    if (json) writeJson({ command: "recover", report: result, selectedPlan: plan });
+    else {
+      process.stdout.write(`Applied: ${plan.label}.\n`);
+      for (const next of result.next ?? []) process.stdout.write(`Next: ${next}\n`);
+    }
+  });
+
 program
   .command("compose")
   .description("run Docker Compose from the local.compose manifest configuration")
@@ -761,16 +843,31 @@ function handleCliError(error: unknown): void {
   process.exitCode = 1;
 }
 
-const execution = directComposeArguments
-  ? Promise.resolve().then(() => {
-      const loaded = loadManifest();
-      const result = runLocalCompose(
-        loaded.root,
-        loaded.manifest,
-        directComposeArguments,
-      );
-      if (result.status !== 0) process.exitCode = result.status;
-    })
-  : program.parseAsync(process.argv);
+const execution = (
+  directComposeArguments
+    ? Promise.resolve().then(() => {
+        const loaded = loadManifest();
+        const result = runLocalCompose(
+          loaded.root,
+          loaded.manifest,
+          directComposeArguments,
+        );
+        if (result.status !== 0) process.exitCode = result.status;
+      })
+    : program.parseAsync(process.argv)
+).then(async () => {
+  if (process.exitCode && process.exitCode !== 0) return;
+  const outcome = await runDailyUpdatePrompt({
+    currentVersion: VERSION,
+    confirmUpdate: promptForDailyUpdate,
+  });
+  if (outcome === "applied") {
+    process.stdout.write("Agent Coordinator was updated successfully.\n");
+  } else if (outcome === "apply-failed") {
+    process.stderr.write(
+      "Agent Coordinator could not update. Your original command completed; run 'coordinator update --apply' to see the full error.\n",
+    );
+  }
+});
 
 execution.catch(handleCliError);

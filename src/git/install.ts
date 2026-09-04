@@ -37,6 +37,44 @@ export interface GitRuntimeOptions {
   stdio?: "pipe" | "inherit" | undefined;
 }
 
+export interface GitRecoveryIssue {
+  code: string;
+  repository: string;
+  message: string;
+  commands: string[];
+}
+
+export interface GitRecoveryPlan {
+  strategy: "align" | "record";
+  label: string;
+  available: boolean;
+  blocked: string[];
+  steps: Array<{
+    repository: string;
+    description: string;
+    from: string;
+    to: string;
+  }>;
+}
+
+export interface GitRecoveryReport {
+  schemaVersion: 1;
+  owner: "Agent Coordinator";
+  root: string;
+  branch: string | null;
+  snapshot: string;
+  issues: GitRecoveryIssue[];
+  plans: GitRecoveryPlan[];
+  lastFailure: {
+    at: string;
+    code: string;
+    operation: string;
+  } | null;
+  applied: boolean;
+  strategy?: "align" | "record";
+  next?: string[];
+}
+
 function environmentFor(options?: GitRuntimeOptions): NodeJS.ProcessEnv {
   return options?.environment ?? process.env;
 }
@@ -833,6 +871,74 @@ export function invokeGitRuntime(
     );
   }
   return execution;
+}
+
+function parseRecoveryReport(execution: CommandResult): GitRecoveryReport {
+  try {
+    const report = JSON.parse(execution.stdout) as GitRecoveryReport;
+    if (
+      report?.schemaVersion !== 1 ||
+      report.owner !== "Agent Coordinator" ||
+      !Array.isArray(report.issues) ||
+      !Array.isArray(report.plans)
+    ) {
+      throw new Error("unsupported recovery report");
+    }
+    return report;
+  } catch {
+    throw new CoordinatorError(
+      `Git recovery returned invalid output: ${execution.stdout || execution.stderr || "empty output"}`,
+      "INVALID_GIT_RECOVERY_REPORT",
+    );
+  }
+}
+
+export function inspectGitRecovery(
+  directory = process.cwd(),
+  options: GitRuntimeOptions = {},
+): GitRecoveryReport {
+  const environment = environmentFor(options);
+  const execution = runCommand(process.execPath, [
+    embeddedGitRuntimeSourcePath(environment),
+    "--diagnose",
+  ], {
+    allowFailure: true,
+    cwd: path.resolve(directory),
+    env: environment,
+  });
+  if (execution.status !== 0) {
+    throw new CoordinatorError(
+      `Git recovery diagnosis failed: ${execution.stderr || execution.stdout || `exit ${execution.status}`}`,
+      "GIT_RECOVERY_DIAGNOSIS_FAILED",
+    );
+  }
+  return parseRecoveryReport(execution);
+}
+
+export function applyGitRecovery(
+  directory: string,
+  strategy: GitRecoveryPlan["strategy"],
+  snapshot: string,
+  options: GitRuntimeOptions = {},
+): GitRecoveryReport {
+  const environment = environmentFor(options);
+  const execution = runCommand(process.execPath, [
+    embeddedGitRuntimeSourcePath(environment),
+    "--recover",
+    strategy,
+    snapshot,
+  ], {
+    allowFailure: true,
+    cwd: path.resolve(directory),
+    env: environment,
+  });
+  if (execution.status !== 0) {
+    throw new CoordinatorError(
+      `Git recovery failed: ${execution.stderr || execution.stdout || `exit ${execution.status}`}`,
+      "GIT_RECOVERY_FAILED",
+    );
+  }
+  return parseRecoveryReport(execution);
 }
 
 export function yamlNativeGitRuntimeActive(root: string): boolean {

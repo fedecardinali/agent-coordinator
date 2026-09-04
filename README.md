@@ -380,6 +380,22 @@ their branch policies, updates root gitlinks, and delegates unrelated Git
 commands to the real Git executable. Outside a configured workspace, Git
 behaves normally.
 
+When a coordinated command cannot proceed, the error includes a stable reason
+and points to the recovery assistant:
+
+```sh
+coordinator git recover
+```
+
+The assistant diagnoses live branch, gitlink, worktree and cached-upstream
+state, shows the last coordinated Git failure, and previews only repairs that
+preserve commits and local files. It can align clean checkouts to recorded
+revisions or keep policy-compatible child checkouts and stage their exact
+gitlinks. It never commits, pushes, resets or stashes automatically. Scripts
+can inspect a plan with `--dry-run` or `--json`; applying one requires
+`--strategy align|record --write`. A snapshot guard rejects the repair if the
+workspace changes after the preview.
+
 Coordinated branch creation accepts `git checkout -b <branch> [<start-point>]`
 and `git switch -c <branch> [<start-point>]`. When a start-point is supplied,
 the wrapper resolves it to a commit before changing anything, reads the
@@ -395,6 +411,13 @@ workspace must be clean; `-B` and `-C` remain intentionally blocked.
 | `fixed` | The child always uses one named branch. Read-only by default. |
 | `map` | Exact coordinator branches map to different child branches, with an optional `mirror` or `fixed` fallback. |
 | `readOnly: true` | The child must remain clean and at the configured revision; coordinated add, commit, and push skip it. |
+
+When switching to an existing coordinator branch, a writable child branch may
+already be ahead of the gitlink recorded there. If that gitlink is an ancestor
+of the child branch, Agent Coordinator preserves the newer child commits and
+stages the advanced gitlink on the selected coordinator branch. Commit that
+gitlink update before switching again. Behind or diverged histories are
+rejected without moving either branch.
 
 A mapped repository can be declared directly in the manifest:
 
@@ -666,6 +689,13 @@ generated outputs.
 If no release has been published yet, the command reports that no
 release is available.
 
+On ordinary interactive invocations, Agent Coordinator also performs this
+check at most once per local calendar day. If a newer release exists, it asks
+whether to install it. The daily check is skipped for CI, non-interactive
+shells, JSON output, help, version, installation and explicit update commands.
+Declining or a temporary check failure does not interrupt the original
+command, and neither is retried until the next day.
+
 ## Migrating an existing legacy workspace
 
 Agent Coordinator understands `.git-coordinator.json` schema 1 and 2.
@@ -733,6 +763,7 @@ need `--force`.
 | `coordinator git uninstall` | Remove only this workspace's managed Git integration. |
 | `coordinator git attach` | Attach policy-resolved repository branches. |
 | `coordinator git check` | Run the coordinated Git invariant check. |
+| `coordinator git recover [--dry-run] [--strategy align\|record --write]` | Diagnose Git coordination failures, preview safe repairs, and optionally apply a reviewed plan. |
 | `coordinator compose [args...]` | Run Docker Compose from `local.compose`, forwarding all remaining arguments. |
 | `coordinator install` | Install or refresh the embedded machine-wide Git runtime. |
 | `coordinator uninstall` | Remove only the managed machine-wide Git runtime. |

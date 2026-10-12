@@ -2447,3 +2447,71 @@ test("pull records a failed synchronization commit for guided completion", () =>
   assert.ok(issue);
   assert.ok(issue.commands.some((command) => /commit/.test(command)));
 });
+
+
+test("status groups files by repository and actual branch without staging", () => {
+  const fixture = createFixture();
+  git(fixture.backend, "checkout", "-b", "feature/status-view");
+  write(fixture.backend, "README.md", "staged change\n");
+  git(fixture.backend, "add", "README.md");
+  write(fixture.backend, "README.md", "unstaged change\n");
+  write(fixture.frontend, "odd\nname.txt", "untracked\n");
+  write(fixture.coordinator, "root.txt", "root\n");
+  const directories = [fixture.coordinator, fixture.backend, fixture.frontend];
+  const before = directories.map((directory) => git(directory, "status", "--porcelain=v1", "-z").stdout);
+  const output = coordinated(fixture.coordinator, "status").stdout;
+  assert.match(output, /coordinator  \(main\)/);
+  assert.match(output, /apps\/backend  \(feature\/status-view\)  1 file/);
+  assert.match(output, /Changes to be committed\n  │  └─ modified: README.md/);
+  assert.match(output, /Changes not staged for commit\n     └─ modified: README.md/);
+  assert.match(output, /apps\/frontend  \(main\)  1 file/);
+  assert.ok(output.includes('"odd\\nname.txt"'));
+  assert.ok(output.includes('root.txt'));
+  assert.deepEqual(directories.map((directory) => git(directory, "status", "--porcelain=v1", "-z").stdout), before);
+});
+
+test("status preserves explicit Git formats and path filters byte for byte", () => {
+  const fixture = createFixture();
+  write(fixture.backend, "README.md", "changed\n");
+  write(fixture.coordinator, "root.txt", "root\n");
+  for (const args of [["--porcelain"], ["--porcelain=v2", "-z"], ["--short"], ["-sb"], ["-z"], ["--", "root.txt"]]) {
+    assert.equal(coordinated(fixture.coordinator, "status", ...args).stdout, git(fixture.coordinator, "status", ...args).stdout);
+  }
+  assert.equal(coordinated(fixture.backend, "status").stdout, git(fixture.backend, "status").stdout);
+});
+
+test("status handles renames, detached children and clean workspaces", () => {
+  const fixture = createFixture();
+  assert.match(coordinated(fixture.coordinator, "status").stdout, /working tree clean/);
+  assert.doesNotMatch(coordinated(fixture.coordinator, "status").stdout, /apps\/backend/);
+  git(fixture.backend, "checkout", "--detach");
+  git(fixture.backend, "mv", "README.md", "renamed file.md");
+  const output = coordinated(fixture.coordinator, "status", "--long").stdout;
+  assert.match(output, /apps\/backend  \(detached at [a-f0-9]+\)  1 file/);
+  assert.ok(output.includes('renamed: README.md -> "renamed file.md"'));
+});
+
+
+test("status colors follow Git settings and keep redirected output readable", () => {
+  const fixture = createFixture();
+  write(fixture.backend, "README.md", "staged\n");
+  git(fixture.backend, "add", "README.md");
+  write(fixture.backend, "README.md", "pending\n");
+  write(fixture.backend, "new.txt", "new\n");
+  const plain = coordinated(fixture.coordinator, "-c", "color.ui=auto", "status").stdout;
+  assert.doesNotMatch(plain, /\x1b\[/);
+  assert.match(plain, /├─ Changes to be committed/);
+  assert.match(plain, /└─ Untracked files/);
+  const colored = coordinatedWithEnvironment(fixture.coordinator, { NO_COLOR: undefined }, "-c", "color.ui=always", "status").stdout;
+  assert.ok(colored.includes("\x1b[1;36mapps/backend\x1b[m"));
+  assert.ok(colored.includes("\x1b[32mmodified: README.md\x1b[m"));
+  assert.ok(colored.includes("\x1b[31mmodified: README.md\x1b[m"));
+  assert.ok(colored.includes("\x1b[33mnew.txt\x1b[m"));
+  assert.equal(colored.replace(/\x1b\[[0-9;]*m/g, ""), plain);
+  const disabled = coordinated(fixture.coordinator, "-c", "color.ui=always", "-c", "color.status=never", "status").stdout;
+  assert.equal(disabled, plain);
+  const noColor = coordinatedWithEnvironment(fixture.coordinator, { NO_COLOR: "1" }, "-c", "color.status=always", "status").stdout;
+  assert.equal(noColor, plain);
+  const custom = coordinatedWithEnvironment(fixture.coordinator, { NO_COLOR: undefined }, "-c", "color.status=always", "-c", "color.status.updated=blue", "status").stdout;
+  assert.ok(custom.includes("\x1b[34mmodified: README.md\x1b[m"));
+});

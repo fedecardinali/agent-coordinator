@@ -4478,7 +4478,7 @@ async function promptDashboardAction() {
 // package.json
 var package_default = {
   name: "agent-coordinator",
-  version: "0.5.0",
+  version: "0.5.1",
   description: "A beautiful control plane for multi-repository Git, coding agents, and delivery workflows.",
   type: "module",
   repository: {

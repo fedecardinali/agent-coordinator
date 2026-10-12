@@ -895,3 +895,24 @@ Agent Coordinator is available under the [Apache License 2.0](LICENSE).
 The license permits use, modification, and distribution for commercial
 purposes, including internal use by companies such as Salesforce, subject to
 the license terms and required notices.
+
+### Grouped Git status
+
+At a configured coordinator root, `git status` (or `git status --long`) groups
+changes by repository, showing each actual branch, file count, staged changes,
+unstaged changes and untracked files. Root gitlink changes remain visible alongside
+the child file details. Clean children are omitted; uninitialized children are
+not initialized by this read-only command. Detached children show their revision.
+
+Explicit options and path filters retain native Git behavior, including
+`git status --short`, `git status --porcelain=v2 -z`, and `git status -- path`.
+Inside a child repository or an ordinary repository, status remains native Git.
+Refresh the installed runtime with `coordinator git install` after upgrading.
+
+The grouped view uses a tree layout, highlighting repositories in cyan, branches
+in yellow, staged files in green, pending files in red and new files in yellow.
+Colors follow `color.status` / `color.ui` (`auto`, `always`, `never`) and Git
+`color.status.<slot>` overrides. Automatic colors are disabled when output is
+redirected or `TERM=dumb`; `NO_COLOR` disables them even when forced.
+Use `git -c color.ui=always status` to force colors, or
+`git -c color.status=never status` for plain text.

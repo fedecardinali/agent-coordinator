@@ -32,6 +32,7 @@ const SUPPORTED_COMMANDS = new Set([
   "commit",
   "pull",
   "push",
+  "status",
   "switch",
   "worktree",
 ]);
@@ -3880,8 +3881,102 @@ function applyRecovery(context, strategy, snapshot) {
   }
 }
 
+function statusPalette(context) {
+  const terminal = Boolean(process.stdout.isTTY) && process.env.TERM !== "dumb";
+  const enabled = executeRootGit(context, [
+    "config", "--get-colorbool", "color.status", String(terminal),
+  ], { capture: true });
+  const colors = {};
+  if (enabled.stdout?.trim() === "true" && process.env.NO_COLOR === undefined) {
+    for (const [slot, fallback] of Object.entries({
+      header: "bold cyan", branch: "yellow", count: "dim",
+      updated: "green", changed: "red", untracked: "yellow", unmerged: "bold magenta",
+    })) {
+      const result = executeRootGit(context, [
+        "config", "--get-color", `color.status.${slot}`, fallback,
+      ], { capture: true });
+      if (result.status === 0) colors[slot] = result.stdout;
+    }
+  }
+  return (slot, value) => colors[slot] ? `${colors[slot]}${value}\x1b[m` : value;
+}
+
+function statusFilename(value) {
+  return /[\s"\\\x00-\x1f\x7f]/.test(value) ? JSON.stringify(value) : value;
+}
+
+function coordinatedStatus(context) {
+  // Explicit formats, filters and pathspecs belong to Git, including machine output.
+  if (context.commandArguments.some((argument) => argument !== "--long")) {
+    return executeRootGit(context, ["status", ...context.commandArguments]).status;
+  }
+  const repositories = [
+    { path: path.basename(context.rootDirectory), directory: context.rootDirectory },
+    ...context.repositories,
+  ];
+  const paint = statusPalette(context);
+  const groupSlots = {
+    "Changes to be committed": "updated",
+    "Changes not staged for commit": "changed",
+    "Untracked files": "untracked",
+    "Unmerged paths": "unmerged",
+  };
+  const labels = {
+    M: "modified", A: "added", D: "deleted", R: "renamed", C: "copied",
+    T: "type changed", U: "unmerged", m: "modified content", "?": "untracked content",
+  };
+  let changed = false;
+  for (const [index, repository] of repositories.entries()) {
+    if (index > 0 && !isRepositoryAt(repository.directory)) continue;
+    const result = executeGit(repository.directory, [
+      ...context.forwardedGlobalOptions,
+      "status", "--porcelain=v1", "-z", "--untracked-files=all",
+    ], { capture: true });
+    if (result.status !== 0) {
+      process.stderr.write(result.stderr ?? "");
+      return result.status;
+    }
+    const groups = { "Changes to be committed": [], "Changes not staged for commit": [], "Untracked files": [], "Unmerged paths": [] };
+    const records = result.stdout.split("\0");
+    let count = 0;
+    for (let offset = 0; offset < records.length; offset += 1) {
+      const record = records[offset];
+      if (!record) continue;
+      count += 1;
+      const status = record.slice(0, 2);
+      let filename = statusFilename(record.slice(3));
+      if (/[RC]/.test(status)) filename = `${statusFilename(records[++offset])} -> ${filename}`;
+      if (status === "??") groups["Untracked files"].push(filename);
+      else if (["DD", "AU", "UD", "UA", "DU", "AA", "UU"].includes(status)) {
+        groups["Unmerged paths"].push(`${status}: ${filename}`);
+      } else {
+        if (status[0] !== " ") groups["Changes to be committed"].push(`${labels[status[0]] ?? status[0]}: ${filename}`);
+        if (status[1] !== " ") groups["Changes not staged for commit"].push(`${labels[status[1]] ?? status[1]}: ${filename}`);
+      }
+    }
+    if (index > 0 && count === 0) continue;
+    const branch = currentBranch(repository.directory) ?? `detached at ${gitText(repository.directory, ["rev-parse", "--short", "HEAD"]).stdout}`;
+    process.stdout.write(`\n${paint("header", repository.path)}  ${paint("branch", `(${branch})`)}  ${paint("count", `${count} ${count === 1 ? "file" : "files"}`)}\n`);
+    const populatedGroups = Object.entries(groups).filter(([, files]) => files.length > 0);
+    for (const [groupIndex, [title, files]] of populatedGroups.entries()) {
+      changed = true;
+      const lastGroup = groupIndex === populatedGroups.length - 1;
+      const slot = groupSlots[title];
+      process.stdout.write(`  ${lastGroup ? "└─" : "├─"} ${paint(slot, title)}\n`);
+      for (const [fileIndex, file] of files.entries()) {
+        const connector = fileIndex === files.length - 1 ? "└─" : "├─";
+        process.stdout.write(`  ${lastGroup ? "  " : "│ "} ${connector} ${paint(slot, file)}\n`);
+      }
+    }
+  }
+  if (!changed) process.stdout.write("\nNothing to commit, working tree clean.\n");
+  return 0;
+}
+
 function dispatch(context) {
   switch (context.command) {
+    case "status":
+      return coordinatedStatus(context);
     case "add":
       return coordinatedAdd(context);
     case "commit":

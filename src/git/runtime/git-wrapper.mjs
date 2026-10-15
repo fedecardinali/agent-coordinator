@@ -1677,7 +1677,12 @@ function coordinatedPull(context) {
       );
     }
     const childPlan = plans.find((plan) => plan.target.repository?.id === repository.id);
-    if (!childPlan || !revisionIsAncestor(repository, revision, childPlan.remoteRevision)) {
+    // Pull preserves a writable branch that is ahead of its remote. Its local
+    // history can already contain the pin (for example, from a release branch).
+    const availableRevision = !repository.branchPolicy.readOnly && childPlan?.state === "ahead"
+      ? childPlan.localRevision
+      : childPlan?.remoteRevision;
+    if (!childPlan || !revisionIsAncestor(repository, revision, availableRevision)) {
       throw new CoordinatedGitError(
         repository.id + " cannot obtain incoming gitlink " + revision.slice(0, 8) +
           " from " + remote + "/" + resolvedRepositoryBranch(repository, branch) +
@@ -2313,9 +2318,15 @@ function prepareRepositoryAtRevision(
       }
       if (!repository.branchPolicy.readOnly) {
         if (revisionIsAncestor(repository, branchRevision, desiredRevision)) {
-          throw new CoordinatedGitError(
-            `${repository.id} branch '${repositoryBranch}' at ${branchRevision.slice(0, 8)} is behind target gitlink ${desiredRevision.slice(0, 8)}. Fast-forward the child branch before switching.`,
-          );
+          return {
+            branch: repositoryBranch,
+            created: false,
+            desiredRevision,
+            detached: false,
+            expectedBranchRevision: branchRevision,
+            fastForward: true,
+            updateGitlink: false,
+          };
         }
         throw new CoordinatedGitError(
           `${repository.id} branch '${repositoryBranch}' at ${branchRevision.slice(0, 8)} has diverged from target gitlink ${desiredRevision.slice(0, 8)}. Resolve the child branch or mapping before switching.`,
@@ -2962,6 +2973,7 @@ function switchCoordinatedBranch(context, branch) {
     state: repositoryState(repository),
   }));
   const createdBranches = [];
+  const fastForwardedBranches = [];
   let rootSwitched = false;
   const targetContext = context.workspaceManifest
     ? manifestPolicyContext(context, branch, { revision: branch })
@@ -3012,6 +3024,21 @@ function switchCoordinatedBranch(context, branch) {
         assertPreparedBranchRevision(repository, prepared, {
           checkedOut: true,
         });
+        if (prepared.fastForward) {
+          const previousRevision = prepared.expectedBranchRevision;
+          const result = executeGit(repository.directory, [
+            "merge", "--ff-only", prepared.desiredRevision,
+          ]);
+          // A hook can fail after Git has already advanced the branch.
+          fastForwardedBranches.push({ repository, prepared, previousRevision });
+          if (result.status !== 0) {
+            throw new CoordinatedGitError(
+              `could not fast-forward '${prepared.branch}' in ${repository.id}.`,
+            );
+          }
+          prepared.expectedBranchRevision = prepared.desiredRevision;
+          assertPreparedBranchRevision(repository, prepared, { checkedOut: true });
+        }
         if (prepared.created) {
           setUpstreamFromRemote(
             targetContext,
@@ -3067,6 +3094,23 @@ function switchCoordinatedBranch(context, branch) {
           { capture: true },
         );
         if (result.status !== 0) gitlinkRollbackFailures.push(repository.id);
+      }
+    }
+    for (const { repository, prepared, previousRevision } of [...fastForwardedBranches].reverse()) {
+      const reference = `refs/heads/${prepared.branch}`;
+      const actualRevision = gitText(repository.directory, ["rev-parse", reference]).stdout;
+      if (actualRevision === previousRevision) continue;
+      const clean = gitText(repository.directory, ["status", "--porcelain"]).stdout === "";
+      let restored = false;
+      if (actualRevision === prepared.desiredRevision && clean) {
+        const detached = currentBranch(repository.directory) !== prepared.branch ||
+          executeGit(repository.directory, ["switch", "--detach", previousRevision], { capture: true }).status === 0;
+        restored = detached && executeGit(repository.directory, [
+          "update-ref", reference, previousRevision, prepared.desiredRevision,
+        ], { capture: true }).status === 0;
+      }
+      if (!restored) {
+        process.stderr.write(`[agent-coordinator] WARNING: rollback needs manual recovery for ${repository.id}:${prepared.branch}.\n`);
       }
     }
     rollbackRepositories(states, createdBranches);

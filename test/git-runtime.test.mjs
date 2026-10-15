@@ -1160,6 +1160,56 @@ test("checkout aborts when a mapped branch changes after planning", () => {
   );
 });
 
+function behindCheckoutFixture(configuration = null) {
+  const fixture = createFixture(configuration);
+  const previousRevision = revision(fixture.backend);
+  coordinated(fixture.coordinator, "checkout", "-b", "release/0.1.0");
+  const targetRevision = gitText(fixture.backend, "commit-tree",
+    `${previousRevision}^{tree}`, "-p", previousRevision, "-m", "target child commit");
+  git(fixture.coordinator, "switch", "main");
+  git(fixture.coordinator, "update-index", "--cacheinfo", `160000,${targetRevision},apps/backend`);
+  git(fixture.coordinator, "commit", "--quiet", "-m", "record newer child gitlink");
+  git(fixture.coordinator, "switch", "release/0.1.0");
+  return { fixture, previousRevision, targetRevision };
+}
+
+for (const command of ["checkout", "switch"]) {
+  test(`${command} fast-forwards a behind child branch to the target gitlink`, () => {
+    const { fixture, targetRevision } = behindCheckoutFixture();
+    coordinated(fixture.coordinator, command, "main");
+    assert.equal(branch(fixture.coordinator), "main");
+    assert.equal(branch(fixture.backend), "main");
+    assert.equal(revision(fixture.backend), targetRevision);
+    assert.equal(gitText(fixture.coordinator, "status", "--porcelain"), "");
+    coordinated(fixture.coordinator, "--check");
+  });
+}
+
+test("checkout rolls back a child fast-forward when the coordinator switch fails", () => {
+  const { fixture, previousRevision } = behindCheckoutFixture();
+  const hooks = path.join(fixture.temporaryDirectory, "fail-root-checkout");
+  mkdirSync(hooks);
+  writeFileSync(path.join(hooks, "post-checkout"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  git(fixture.coordinator, "config", "core.hooksPath", hooks);
+  const result = coordinatedAllowFailure(fixture.coordinator, "checkout", "main");
+  assert.notEqual(result.status, 0);
+  assert.equal(branch(fixture.coordinator), "release/0.1.0");
+  assert.equal(branch(fixture.backend), "release/0.1.0");
+  assert.equal(revision(fixture.backend), previousRevision);
+  assert.equal(gitText(fixture.backend, "rev-parse", "main"), previousRevision);
+  assert.equal(gitText(fixture.coordinator, "status", "--porcelain"), "");
+});
+
+test("checkout fast-forwards a writable mapped branch already checked out", () => {
+  const { fixture, targetRevision } = behindCheckoutFixture(mixedPolicyConfiguration({
+    mode: "map", branches: { main: "main", "release/0.1.0": "main" },
+  }));
+  coordinated(fixture.coordinator, "checkout", "main");
+  assert.equal(revision(fixture.backend), targetRevision);
+  assert.equal(branch(fixture.backend), "main");
+  assert.equal(gitText(fixture.coordinator, "status", "--porcelain"), "");
+});
+
 test("checkout rejects divergent mapped branches without mutation", () => {
   const { fixture, originalGitlink } = mappedCheckoutFixture();
 
@@ -2241,6 +2291,23 @@ test("Git recovery rejects a stale reviewed plan", () => {
     gitText(fixture.coordinator, "rev-parse", ":apps/backend"),
     advanced,
   );
+});
+
+test("pull preserves a local child ahead of main with a gitlink published on a release branch", () => {
+  const { fixture, targetRevision } = behindCheckoutFixture();
+  git(fixture.backend, "push", "--quiet", "origin", `${targetRevision}:refs/heads/release/0.1.0`);
+  coordinated(fixture.coordinator, "checkout", "main");
+  git(fixture.coordinator, "push", "--quiet", "origin", "main");
+  const coordinatorRevision = revision(fixture.coordinator);
+  const remoteRevision = gitText(fixture.backend, "rev-parse", "origin/main");
+  assert.notEqual(targetRevision, remoteRevision);
+
+  coordinated(fixture.coordinator, "pull");
+
+  assert.equal(revision(fixture.coordinator), coordinatorRevision);
+  assert.equal(revision(fixture.backend), targetRevision);
+  assert.equal(gitText(fixture.backend, "rev-parse", "origin/main"), remoteRevision);
+  assert.equal(gitText(fixture.coordinator, "status", "--porcelain"), "");
 });
 
 test("pull rejects an unpublished incoming gitlink before moving any HEAD", () => {

@@ -416,8 +416,9 @@ When switching to an existing coordinator branch, a writable child branch may
 already be ahead of the gitlink recorded there. If that gitlink is an ancestor
 of the child branch, Agent Coordinator preserves the newer child commits and
 stages the advanced gitlink on the selected coordinator branch. Commit that
-gitlink update before switching again. Behind or diverged histories are
-rejected without moving either branch.
+gitlink update before switching again. If the child branch is behind the target
+gitlink, Agent Coordinator fast-forwards it to that exact commit automatically.
+Diverged histories are rejected without moving either branch.
 
 A mapped repository can be declared directly in the manifest:
 
